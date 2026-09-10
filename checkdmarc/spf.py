@@ -1289,6 +1289,33 @@ def parse_spf_record(
             elif mechanism == "exists":
                 _count_dns_lookups()
                 mechanism_dns_lookups += 1
+                # RFC 7208 section 5.7 uses A records even for IPv6
+                # senders. A missing A answer is void even if AAAA exists.
+                if "%" in value:
+                    warnings.append(
+                        "The exists target contains macros and was not resolved; "
+                        "its void lookup count depends on the sender context "
+                        "(RFC 7208 § 5.7)."
+                    )
+                else:
+                    try:
+                        a_records = query_dns(
+                            value,
+                            "A",
+                            nameservers=nameservers,
+                            resolver=resolver,
+                            timeout=timeout,
+                            retries=retries,
+                        )
+                    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+                        a_records = []
+                    except dns.exception.DNSException as dns_error:
+                        raise DNSException(dns_error)
+                    if not a_records:
+                        raise _SPFMissingRecords(
+                            f"An exists mechanism points to {value}, but that "
+                            "domain/subdomain does not have any A records."
+                        )
                 exists_mechanism: SPFDNSLookupMechanism = {
                     "action": action,
                     "mechanism": mechanism,

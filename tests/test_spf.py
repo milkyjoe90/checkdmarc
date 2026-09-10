@@ -6,6 +6,7 @@ from typing import Any, cast
 from unittest.mock import patch
 
 import dns.exception
+import dns.resolver
 
 import checkdmarc.spf
 from checkdmarc.spf import (
@@ -374,7 +375,7 @@ class Test(unittest.TestCase):
         domain = "example.com"
         results = checkdmarc.spf.parse_spf_record(spf_record, domain)
         self.assertIn("mechanisms", results["parsed"])
-        self.assertEqual(len(results["warnings"]), 0)
+        self.assertTrue(any("sender context" in w for w in results["warnings"]))
         self.assertEqual(results["dns_lookups"], 1)
 
     def testSPFBrokenExistsMechanismMacro(self):
@@ -1602,7 +1603,10 @@ class TestRFC7208Conformance(unittest.TestCase):
             "v=spf1 exists:foo!bar.example.com -all",
             "v=spf1 exists:%{d},%{i}.example.com -all",
         ):
-            with self.subTest(record=record):
+            with (
+                self.subTest(record=record),
+                patch("checkdmarc.spf.query_dns", return_value=["192.0.2.1"]),
+            ):
                 result = checkdmarc.spf.parse_spf_record(record, "example.com")
                 self.assertEqual(result["dns_lookups"], 1)
 
@@ -1767,6 +1771,70 @@ class TestRFC7208Conformance(unittest.TestCase):
                 "v=spf1 a:mail.example.com -all", "example.com"
             )
             self.assertFalse(any("top-level label" in w for w in result["warnings"]))
+
+    def testLiteralExistsCountsOnlyAAnswers(self):
+        def lookup(domain, record_type, **kwargs):
+            return [] if record_type == "A" else ["2001:db8::1"]
+
+        with patch("checkdmarc.spf.query_dns", side_effect=lookup):
+            result = checkdmarc.spf.parse_spf_record(
+                "v=spf1 exists:ipv6only.example -all", "example.com"
+            )
+        self.assertEqual(result["dns_lookups"], 1)
+        self.assertEqual(result["void_dns_lookups"], 1)
+        self.assertTrue(
+            any("does not have any A records" in w for w in result["warnings"])
+        )
+
+    def testExistsVoidLimitCoversEmptyNXDOMAINAndNoAnswer(self):
+        for missing in ([], dns.resolver.NXDOMAIN(), dns.resolver.NoAnswer()):
+            with (
+                self.subTest(missing=missing),
+                patch(
+                    "checkdmarc.spf.query_dns",
+                    side_effect=missing if isinstance(missing, BaseException) else None,
+                    return_value=missing,
+                ),
+                self.assertRaises(checkdmarc.spf.SPFTooManyVoidDNSLookups) as error,
+            ):
+                checkdmarc.spf.parse_spf_record(
+                    "v=spf1 exists:a.example exists:b.example exists:c.example -all",
+                    "example.com",
+                )
+            self.assertEqual(error.exception.data, {"void_dns_lookups": 3})
+
+    def testExistsPositiveAnswerAndUnresolvedMacroAreDistinct(self):
+        with patch("checkdmarc.spf.query_dns", return_value=["192.0.2.1"]):
+            literal = checkdmarc.spf.parse_spf_record(
+                "v=spf1 exists:one.example -all", "example.com"
+            )
+        with patch(
+            "checkdmarc.spf.query_dns",
+            side_effect=AssertionError("Unexpanded macro queried"),
+        ):
+            macro = checkdmarc.spf.parse_spf_record(
+                "v=spf1 exists:%{i}.example -all", "example.com"
+            )
+        self.assertEqual(literal["void_dns_lookups"], 0)
+        self.assertFalse(any("not resolved" in w for w in literal["warnings"]))
+        self.assertTrue(any("not resolved" in w for w in macro["warnings"]))
+
+    def testNestedExistsSharesVoidBudget(self):
+        with (
+            patch("checkdmarc.spf.query_dns", return_value=[]),
+            patch(
+                "checkdmarc.spf.query_spf_record",
+                return_value={
+                    "record": "v=spf1 exists:b.example exists:c.example -all",
+                    "warnings": [],
+                },
+            ),
+            self.assertRaises(checkdmarc.spf.SPFTooManyVoidDNSLookups) as error,
+        ):
+            checkdmarc.spf.parse_spf_record(
+                "v=spf1 exists:a.example include:child.example -all", "example.com"
+            )
+        self.assertEqual(error.exception.data, {"void_dns_lookups": 3})
 
     def testRecursiveLookupBudgetStopsBeforeEleventhTarget(self):
         """An attacker-controlled infinite chain is bounded before querying it."""

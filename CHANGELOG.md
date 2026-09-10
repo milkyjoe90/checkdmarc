@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- SPF `exists` checks count missing A answers as void lookups and identify unresolved sender-dependent macros (RFC 7208 §5.7).
 - SPF validates syntax throughout the record, including unreachable terms after `all`, before resolving mechanisms (RFC 7208 §4.6).
 - DNS and MX caches now honor answer TTLs, including alias-chain TTLs, and isolate resolver configurations (RFC 1035 §4.1.3).
 - Reject malformed MTA-STS record whitespace and policy line endings (RFC 8461 §§3.1–3.2).
