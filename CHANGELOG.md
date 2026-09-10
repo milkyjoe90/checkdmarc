@@ -4,6 +4,7 @@
 
 ### Security
 
+- BIMI downloads reject deprecated site-local IPv6 destinations even when Python classifies them as global (RFC 3879 §4).
 - DNSSEC rejects chains whose verified signatures expire during a lookup while retaining valid zero-TTL answers for that transaction (RFC 4035 §5.3.1).
 - DNSSEC reuses parent authentication attempts within one check so repeated signatures cannot multiply failed chain walks.
 - BIMI bounds embedded-logo expansion, skips extraction from invalid certificates, and reports malformed gzip without aborting the check.

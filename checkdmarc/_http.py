@@ -71,10 +71,14 @@ def _public_addresses(hostname: str, port: int) -> list[tuple[int, tuple]]:
             or ip in ipaddress.IPv6Network("64:ff9b::/96")
             or ip in ipaddress.IPv6Network("64:ff9b:1::/48")
         )
+        # RFC 3879 section 4 permits legacy use of deprecated FEC0::/10.
+        # Exclude it explicitly even when ipaddress marks it as global.
+        site_local = isinstance(ip, ipaddress.IPv6Address) and ip.is_site_local
         if (
             not ip.is_global
             or ip.is_multicast
             or ip.is_reserved
+            or site_local
             or transition
             or special
         ):
