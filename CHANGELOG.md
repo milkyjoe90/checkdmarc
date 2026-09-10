@@ -4,6 +4,7 @@
 
 ### Security
 
+- BIMI downloads require public destinations and HTTPS on every redirect, pin checked addresses while verifying TLS identity, and cap response size and redirects (BIMI draft §7.5).
 - SPF shares lookup budgets across recursive includes and redirects, stopping before an eleventh target is fetched (RFC 7208 §4.6.4).
 - BIMI certificate validation now rejects every verification or required-field failure and checks validity at the current time on each request (RFC 5280 §6.1.3).
 

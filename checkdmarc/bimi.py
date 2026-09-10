@@ -50,6 +50,7 @@ from checkdmarc._constants import (
     SYNTAX_ERROR_MARKER,
     USER_AGENT,
 )
+from checkdmarc._http import MAX_HTTP_REDIRECTS, PublicHTTPSAdapter, validate_https_url
 from checkdmarc.dmarc import DMARCErrorResults, DMARCResults
 from checkdmarc.utils import (
     WSP_REGEX,
@@ -1099,6 +1100,12 @@ def parse_bimi_record(
             processing failure is reported as an ``error`` entry under
             ``image`` or ``certificate``.
 
+            Downloads require public addresses and HTTPS on every redirect.
+            At most five redirects and 1 MiB per response (including expanded
+            HTTP gzip content) are allowed. Environment proxies and netrc
+            credentials are not used. The timeout limits socket inactivity;
+            hosted callers should also impose a deadline for the entire job.
+
          .. note::
             ``description`` is only included if
             ``include_tag_descriptions`` is set to ``True``
@@ -1115,6 +1122,11 @@ def parse_bimi_record(
     valid_cert = False
     logger.debug("Parsing the BIMI record")
     session = requests.Session()
+    session.trust_env = False
+    session.max_redirects = MAX_HTTP_REDIRECTS
+    adapter = PublicHTTPSAdapter()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
     session.headers.update({"User-Agent": USER_AGENT})
     spf_in_bimi_error_msg = (
         "Found an SPF record where a BIMI record "
@@ -1256,6 +1268,7 @@ def parse_bimi_record(
     if l_tag_value != "":
         raw_xml = None
         try:
+            validate_https_url(l_tag_value)
             response = session.get(l_tag_value, timeout=http_timeout)
             response.raise_for_status()
             raw_xml = response.content
@@ -1290,6 +1303,7 @@ def parse_bimi_record(
     a_tag_value = tags.get("a", {}).get("value", "")
     if a_tag_value != "":
         try:
+            validate_https_url(a_tag_value)
             response = session.get(a_tag_value, timeout=http_timeout)
             response.raise_for_status()
             pem_bytes = response.content
