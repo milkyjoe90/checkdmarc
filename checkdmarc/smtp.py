@@ -512,6 +512,7 @@ def get_mx_hosts(
                 try:
                     _addresses = get_a_records(
                         reverse_hostname,
+                        nameservers=nameservers,
                         resolver=resolver,
                         timeout=timeout,
                         retries=retries,

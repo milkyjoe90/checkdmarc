@@ -9,6 +9,7 @@ import smtplib
 import socket
 import ssl
 import unittest
+from contextlib import ExitStack
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
@@ -347,6 +348,25 @@ class TestGetMxHosts(unittest.TestCase):
                 p.stop()
         self.assertEqual(len(result["hosts"]), 1)
         self.assertEqual(result["hosts"][0]["hostname"], "mail.example.com")
+        self.assertEqual(result["warnings"], [])
+
+    def testReverseDnsConfirmationUsesSelectedNameservers(self):
+        """A consistent custom DNS view does not acquire a false PTR warning."""
+        selected = ["192.0.2.53"]
+
+        def addresses(hostname, *, nameservers=None, **kwargs):
+            return ["192.0.2.1"] if nameservers == selected else ["192.0.2.2"]
+
+        with ExitStack() as stack:
+            for dns_patch in self._patch_dns(
+                [self._mx("mail.example.com")], reverse=["ptr.example.com"]
+            ):
+                stack.enter_context(dns_patch)
+            stack.enter_context(
+                patch("checkdmarc.smtp.get_a_records", side_effect=addresses)
+            )
+            result = checkdmarc.smtp.get_mx_hosts("example.com", nameservers=selected)
+        self.assertEqual(result["hosts"][0].get("addresses"), ["192.0.2.1"])
         self.assertEqual(result["warnings"], [])
 
     def testDuplicateHostname(self):
