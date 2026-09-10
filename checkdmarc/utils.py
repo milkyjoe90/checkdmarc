@@ -161,6 +161,13 @@ class MXRecord(TypedDict):
     preference: int
 
 
+class TLSACertificateResult(TypedDict):
+    """Host certificate comparison; None means unassessed, with a reason."""
+
+    matched: bool | None
+    reason: str
+
+
 class MXHost(MXRecord, total=False):
     """A Mail Exchange host
 
@@ -173,6 +180,7 @@ class MXHost(MXRecord, total=False):
     addresses: list[str]
     dnssec: bool
     tlsa: list[str]
+    tlsa_certificate: TLSACertificateResult
     tls: bool
     starttls: bool
 

@@ -23,6 +23,7 @@ from checkdmarc._constants import (
     SMTP_CACHE_MAX_AGE_SECONDS,
     SMTP_CACHE_MAX_LEN,
 )
+from checkdmarc._dane import _check_tlsa_certificate
 from checkdmarc.dnssec import check_dnssec, get_tlsa_records
 from checkdmarc.mta_sts import mx_in_mta_sts_patterns
 from checkdmarc.utils import (
@@ -340,7 +341,9 @@ def get_mx_hosts(
                        - ``hostname`` - A hostname
                        - ``dnssec`` - DNSSEC status
                        - ``addresses`` - A ``list`` of IP addresses
-                       - ``tlsa`` - A list of TLSA records, if they exist
+                       - ``tlsa`` - DNSSEC-authenticated TLSA records, if found
+                       - ``tlsa_certificate`` - Host certificate match result;
+                         ``matched`` is None when unassessed, with a reason
                        - ``tls`` - TLS support status (absent if TLS testing is skipped)
                        - ``starttls`` - STARTTLS support status (absent if TLS testing is skipped)
 
@@ -527,9 +530,18 @@ def get_mx_hosts(
         if check_mx_tls and platform.system() == "Windows":
             logger.warning("Testing TLS is not supported on Windows")
             check_mx_tls = False
+        host["tlsa_certificate"] = {
+            "matched": None,
+            "reason": "SMTP certificate testing was not requested or is unavailable",
+        }
         if not check_mx_tls:
             logger.debug(f"Skipping TLS/SSL tests on {hostname}")
         else:
+            host["tlsa_certificate"] = _check_tlsa_certificate(
+                hostname, host.get("tlsa", [])
+            )
+            if host["tlsa_certificate"]["matched"] is False:
+                warnings.append(f"{hostname}: {host['tlsa_certificate']['reason']}")
             try:
                 starttls = test_starttls(hostname, cache=STARTTLS_CACHE)
                 tls = starttls
@@ -605,7 +617,9 @@ def check_mx(
                        - ``hostname`` - A hostname
                        - ``dnssec`` - DNSSEC status
                        - ``addresses`` - A ``list`` of IP addresses
-                       - ``tlsa`` - A list of TLSA records, if they exist
+                       - ``tlsa`` - DNSSEC-authenticated TLSA records, if found
+                       - ``tlsa_certificate`` - Host certificate match result;
+                         ``matched`` is None when unassessed, with a reason
                        - ``tls`` - TLS support status (absent if TLS testing is skipped)
                        - ``starttls`` - STARTTLS support status (absent if TLS testing is skipped)
 

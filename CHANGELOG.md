@@ -12,6 +12,7 @@
 
 ### Fixed
 
+- Optional SMTP checks now compare peer certificates with authenticated TLSA data and report matches, mismatches, or unassessed results with explicit limits (RFC 7672 §3).
 - SPF validates unknown-modifier macros and distinguishes explanation-domain macros from fetched explanation text (RFC 7208 §7).
 - SPF returns bounded diagnostics consistently for direct and nested void-limit failures when `ignore_too_many_lookups` is requested (RFC 7208 §4.6.4).
 - Nonexistent subdomains continue DMARC discovery so parent `np` policies remain available (RFC 9989 §4.10.1).

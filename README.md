@@ -33,7 +33,7 @@ Please consider [sponsoring my work](https://github.com/sponsors/seanthegeek) if
   - Preference
   - IPv4 and IPv6 addresses
   - Optional STARTTLS and TLS testing (pass `--check-mx-tls`)
-  - Use of DNSSEC/TLSA/DANE to pin certificates
+  - Optional host certificate matching against authenticated TLSA records (DANE-EE and DANE-TA)
 - MTA-STS
 - SMTP TLS reporting
   - Record and policy parsing and validation
@@ -52,6 +52,29 @@ lookups. The check does not authenticate denial of existence or wildcard
 expansion. `tlsa` contains only authenticated records at the exact queried name;
 CNAME/DNAME aliases and wildcard answers are not followed by this lookup.
 The raw `get_dnskey()` library helper returns keys without authenticating them.
+
+## TLSA certificate checks
+
+With `--check-mx-tls`, each MX host's `tlsa_certificate.matched` is `true` when
+its port 25 STARTTLS certificate matches authenticated TLSA data, `false` when
+usable associations fail to match or DANE-TA certificate validation fails, and
+`null` when unassessed or unavailable. `reason` explains the result. Without the
+flag, certificate matching is unassessed. Ordinary `tls` and `starttls` results
+continue to use normal public CA verification and can differ from TLSA matching.
+
+DANE-EE usage 3 supports certificate and public key selectors with full,
+SHA-256, or SHA-512 matching. It permits expired, self-signed, and differently
+named certificates as required by RFC 7672. DANE-TA usage 2 validates the host
+name and certificate chain using only the TLSA trust anchors. Full `2 0 0`
+certificates work on all supported Python versions; other usage 2 forms require
+Python 3.13 or newer's public peer certificate chain API. The strongest usable
+digest is selected per usage and selector, while full matches remain eligible.
+Checks may open two additional SMTP connections per host and are not cached.
+
+This is a host certificate check, not a claim that the domain's complete DANE
+mail delivery route is secure: the MX lookup that selects the host is not
+DNSSEC-authenticated by this check, and TLSA aliases and wildcard proofs are
+not supported. No mail is sent.
 
 ## Docker support
 
