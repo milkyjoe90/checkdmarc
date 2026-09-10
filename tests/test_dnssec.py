@@ -379,9 +379,9 @@ class TestGetDnskey(unittest.TestCase):
 class TestCheckDnssec(unittest.TestCase):
     """check_dnssec unit tests with the network mocked out
 
-    The query order under test: DS at the domain (falling back to the base
-    domain), then DNSKEY at the zone the DS anchors, then — for names below
-    the zone apex — MX, A, NS, and CNAME at the domain itself.
+    The query order under test: DS at the domain (walking through DNS
+    ancestors), then DNSKEY at the zone the DS anchors, then — for names below
+    the zone apex — MX, A, AAAA, NS, TXT, and CNAME at the domain itself.
     """
 
     def testUnscopedBooleanCacheIsNotTrusted(self):
@@ -421,7 +421,10 @@ class TestCheckDnssec(unittest.TestCase):
         cache = _fresh_cache()
         _, key, sig = _signed_zone("example.com.")
         with (
-            patch("dns.query.tcp", side_effect=[_response(), _response(key, sig)]),
+            patch(
+                "dns.query.tcp",
+                side_effect=[_response(), _response(), _response(key, sig)],
+            ),
             self.assertLogs("checkdmarc.dnssec", level="WARNING") as logs,
         ):
             result = checkdmarc.dnssec.check_dnssec(

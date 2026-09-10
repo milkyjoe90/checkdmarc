@@ -15,6 +15,7 @@
 
 ### Fixed
 
+- DNSSEC discovery walks DNS ancestors beyond public-suffix registration boundaries to find the signing zone (RFC 4035 §5.2).
 - BIMI HTTPS downloads accept a final DNS root dot while verifying the undotted TLS identity and preserving the DNS query name (RFC 6066 §3).
 - BIMI SVGs are checked against the published Tiny PS schema with bounded XML parsing and local references, while optional viewBox and recommended size limits follow the profile (SVG Tiny PS draft §7).
 - MX reverse-DNS confirmation uses the selected nameservers consistently.

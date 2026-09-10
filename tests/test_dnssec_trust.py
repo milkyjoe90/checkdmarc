@@ -18,11 +18,12 @@ from checkdmarc import dnssec
 
 
 class SignedDNS:
-    def __init__(self):
+    def __init__(self, zones=None, hostname="mail.example.com"):
         self.records = {}
         self.keys = {}
         self.private_keys = {}
-        for zone, parent in [(".", None), ("com.", "."), ("example.com.", "com.")]:
+        zones = zones or [(".", None), ("com.", "."), ("example.com.", "com.")]
+        for zone, parent in zones:
             name = dns.name.from_text(zone)
             private = ec.generate_private_key(ec.SECP256R1())
             key = dns.dnssec.make_dnskey(
@@ -41,14 +42,12 @@ class SignedDNS:
                 self.publish(ds, parent)
         self.tlsa = "3 1 1 " + "ab" * 32
         self.publish(
-            dns.rrset.from_text(
-                "_25._tcp.mail.example.com.", 300, "IN", "TLSA", self.tlsa
-            ),
-            "example.com.",
+            dns.rrset.from_text(f"_25._tcp.{hostname}.", 300, "IN", "TLSA", self.tlsa),
+            zones[-1][0],
         )
         self.publish(
-            dns.rrset.from_text("mail.example.com.", 300, "IN", "A", "192.0.2.1"),
-            "example.com.",
+            dns.rrset.from_text(f"{hostname}.", 300, "IN", "A", "192.0.2.1"),
+            zones[-1][0],
         )
 
     def publish(self, rrset, signer, lifetime=300):
@@ -354,3 +353,21 @@ class TestDNSSECTrust(unittest.TestCase):
         signatures.add(signature.replace(expiration=int(time.time()) - 1))
         self.assertIs(self.check("mail.example.com"), True)
         self.assertEqual(self.tlsa(), [self.dns.tlsa])
+
+    def test_private_public_suffix_is_not_a_dns_zone_boundary(self):
+        # github.io is a private PSL suffix: foo.github.io is the registrable
+        # name, but its A record can be signed by the ancestor github.io zone.
+        fixture = SignedDNS(
+            [(".", None), ("io.", "."), ("github.io.", "io.")],
+            hostname="foo.github.io",
+        )
+        with (
+            patch.object(dnssec, "_ROOT_DS", fixture.anchor),
+            patch.object(dnssec, "_query_nameserver", side_effect=fixture.query),
+        ):
+            self.assertIs(self.check("foo.github.io"), True)
+            self.assertIs(self.check("foo.github.io."), True)
+
+    def test_signed_ancestor_does_not_authenticate_an_unsigned_child(self):
+        self.dns.records.pop(("example.com.", dns.rdatatype.DS))
+        self.assertIs(self.check("mail.example.com"), False)

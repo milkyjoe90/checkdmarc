@@ -536,20 +536,13 @@ def check_dnssec(
 
     domain = normalize_domain(domain)
 
-    # Find the zone the parent vouches for by walking from the domain
-    # itself up through each ancestor to the base domain and using the
-    # first (deepest) name with a DS record. A delegated signed zone
-    # between the queried name and the base domain (for example
-    # signed-child.example.com under www.signed-child.example.com) holds
-    # the keys that actually sign the name's records, so jumping straight
-    # to the base domain would validate against the wrong keys.
-    base_domain = get_base_domain(domain)
-    labels = domain.split(".")
-    base_label_count = len(base_domain.split("."))
-    candidates = [
-        ".".join(labels[i:]) for i in range(max(1, len(labels) - base_label_count + 1))
-    ]
-    zone = candidates[-1]
+    # RFC 4035 section 5.2 follows DNS delegations, not registration
+    # boundaries from the public suffix list. A private PSL suffix can sit
+    # inside a signed DNS zone, so visit every DNS ancestor and use the
+    # deepest name with a DS record. DNS name length bounds this walk.
+    labels = domain.rstrip(".").split(".")
+    candidates = [".".join(labels[i:]) for i in range(len(labels))]
+    zone = domain
     ds_rrset = None
     ds_response = None
     for candidate in candidates:
@@ -661,7 +654,7 @@ def check_dnssec(
         )
         return False
 
-    if zone == domain:
+    if zone_name == dns.name.from_text(domain):
         # The domain is the zone apex, and its DNSKEY record set — one of
         # the zone's own record sets — just validated against the parent's
         # DS record.
