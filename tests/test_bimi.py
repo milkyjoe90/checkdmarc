@@ -1173,12 +1173,11 @@ class TestParseBimiRecordExtraBranches(unittest.TestCase):
 # ============================================================
 #
 # These build a self-signed x509 certificate at runtime via the cryptography
-# library and feed its PEM bytes to get_certificate_metadata. The verifier
-# rejects every self-signed cert (no recognized CA chain), so all tests run
-# through the VerificationError -> "not issued by a recognized MVA" branch
-# regardless of what else they test. That's expected; the goal here is
-# coverage of the surrounding validation logic (extensions, mark types,
-# subject fields, time bounds).
+# library and feed its PEM bytes to get_certificate_metadata. Untrusted
+# certificates can fail for different reasons, including a missing SAN
+# before chain building. Tests of other validation rules explicitly trust
+# a generated certificate when needed, so an unrelated chain error cannot
+# hide an incorrect success result.
 
 
 def _build_cert(
@@ -1278,6 +1277,22 @@ def _logotype_extension(svg_bytes: bytes):
     return x509.UnrecognizedExtension(checkdmarc.bimi.OID_LOGOTYPE, ext_value)
 
 
+def _trust_certificate(pem: bytes):
+    """Use a generated certificate as a trust anchor for one isolated test."""
+    from cryptography.x509 import load_pem_x509_certificates
+    from cryptography.x509.verification import PolicyBuilder, Store
+
+    builder = (
+        PolicyBuilder()
+        .store(Store(load_pem_x509_certificates(pem)))
+        .extension_policies(
+            ee_policy=checkdmarc.bimi._ee_policy,
+            ca_policy=checkdmarc.bimi._ca_policy,
+        )
+    )
+    return patch("checkdmarc.bimi._builder", builder)
+
+
 class TestGetCertificateMetadata(unittest.TestCase):
     """Coverage for get_certificate_metadata against synthesized x509 certs"""
 
@@ -1289,8 +1304,96 @@ class TestGetCertificateMetadata(unittest.TestCase):
         )
         result = checkdmarc.bimi.get_certificate_metadata(pem)
         errs = result["validation_errors"]
+        self.assertFalse(result["valid"])
         self.assertTrue(any("subjectAlternativeName" in e for e in errs))
         self.assertTrue(any("logotype" in e for e in errs))
+
+    def testMissingSANCannotValidateAnUntrustedLogo(self):
+        """A self-signed mark with no identity cannot validate a matching logo."""
+        name_attrs, custom_attrs = _full_subject_attrs()
+        svg = VALID_SVG.encode()
+        pem = _build_cert(
+            subject_attrs=name_attrs,
+            custom_oid_subject_attrs=custom_attrs,
+            extensions=[(_logotype_extension(svg), False)],
+        )
+        with patch(
+            "checkdmarc.bimi.requests.Session.get",
+            side_effect=[_fake_response(svg), _fake_response(pem)],
+        ):
+            result = checkdmarc.bimi.parse_bimi_record(
+                "v=BIMI1; l=https://example.com/logo.svg; "
+                "a=https://example.com/mark.pem",
+                domain="example.com",
+            )
+        self.assertFalse(result["certificate"]["valid"])
+        self.assertIsNone(result["certificate"]["domains"])
+        self.assertTrue(
+            any("without a valid mark certificate" in w for w in result["warnings"])
+        )
+        self.assertTrue(
+            any(
+                "validation failed" in error
+                for error in result["certificate"]["validation_errors"]
+            )
+        )
+
+    def testTrustedCertificateStillRequiresLogotype(self):
+        """A successful chain cannot override a missing required extension."""
+        name_attrs, custom_attrs = _full_subject_attrs()
+        pem = _build_cert(
+            subject_attrs=name_attrs,
+            custom_oid_subject_attrs=custom_attrs,
+            san_dns=["example.com"],
+        )
+        with _trust_certificate(pem):
+            result = checkdmarc.bimi.get_certificate_metadata(pem)
+        self.assertFalse(result["valid"])
+        self.assertEqual(
+            result["validation_errors"],
+            ["The certificate does not contain the required extension: logotype."],
+        )
+
+    def testCertificateValidationUsesCurrentTimeOnEveryCheck(self):
+        """A long-lived worker accepts a newly valid mark at its current time."""
+        from datetime import datetime, timedelta, timezone
+
+        issued = datetime.now(timezone.utc) + timedelta(days=2)
+        name_attrs, custom_attrs = _full_subject_attrs()
+        pem = _build_cert(
+            subject_attrs=name_attrs,
+            custom_oid_subject_attrs=custom_attrs,
+            san_dns=["example.com"],
+            not_valid_before=issued,
+            not_valid_after=issued + timedelta(days=90),
+            extensions=[(_logotype_extension(VALID_SVG.encode()), False)],
+        )
+        with (
+            _trust_certificate(pem),
+            patch("checkdmarc.bimi.datetime", wraps=datetime) as clock,
+        ):
+            clock.now.return_value = issued - timedelta(days=1)
+            before = checkdmarc.bimi.get_certificate_metadata(pem)
+            clock.now.return_value = issued + timedelta(days=1)
+            after = checkdmarc.bimi.get_certificate_metadata(pem)
+        self.assertFalse(before["valid"])
+        self.assertTrue(after["valid"], after["validation_errors"])
+        self.assertEqual(after["validation_errors"], [])
+
+    def testTrustedPriorUseMarkRequiresSourceURL(self):
+        """A missing required subject field remains fatal after chain success."""
+        name_attrs, custom_attrs = _full_subject_attrs("Prior Use Mark")
+        pem = _build_cert(
+            subject_attrs=name_attrs,
+            custom_oid_subject_attrs=custom_attrs,
+            san_dns=["example.com"],
+            extensions=[(_logotype_extension(VALID_SVG.encode()), False)],
+        )
+        with _trust_certificate(pem):
+            result = checkdmarc.bimi.get_certificate_metadata(pem)
+        self.assertFalse(result["valid"])
+        self.assertEqual(len(result["validation_errors"]), 1)
+        self.assertIn("priorUseMarkSourceURL", result["validation_errors"][0])
 
     def testForbiddenExtensionRejected(self):
         """A cert with NameConstraints is marked invalid"""

@@ -470,7 +470,6 @@ _builder = (
     .extension_policies(ee_policy=_ee_policy, ca_policy=_ca_policy)
     .max_chain_depth(5)
 )
-_verifier = _builder.build_client_verifier()
 
 
 class BIMIError(Exception):
@@ -687,7 +686,6 @@ def get_certificate_metadata(pem_crt: bytes, *, domain=None) -> dict[str, Any]:
         )  # pyright: ignore[reportAttributeAccessIssue]
 
     metadata = {}
-    valid = True
     validation_errors: list[str] = []
     warnings: list[str] = []
     certs = load_pem_x509_certificates(pem_crt)
@@ -704,7 +702,6 @@ def get_certificate_metadata(pem_crt: bytes, *, domain=None) -> dict[str, Any]:
         try:
             vmc.extensions.get_extension_for_oid(extension)
             ext_label = OID_LABELS[extension]
-            valid = False
             validation_errors.append(
                 f"The certificate contains a forbidden extension: {ext_label}."
             )
@@ -718,32 +715,33 @@ def get_certificate_metadata(pem_crt: bytes, *, domain=None) -> dict[str, Any]:
             validation_errors.append(
                 "Certificates issued on or after 2025-03-15 must not contain the Pilot identifier extension."
             )
-            valid = False
         except ExtensionNotFound:
             pass
     cert_domains = get_certificate_domains(vmc)
     intermediates = certs[1:] if len(certs) > 0 else []
     try:
-        _verifier.verify(vmc, intermediates)
+        # RFC 5280 section 6.1.3 requires validation at the current time.
+        # A verifier retains its creation time, so do not reuse one across
+        # checks in a long-lived monitoring process.
+        verifier = _builder.time(datetime.now(timezone.utc)).build_client_verifier()
+        verifier.verify(vmc, intermediates)
     except VerificationError as e:
         e_str = str(e)
-        metadata["valid"] = False
         logger.debug(f"Certificate ValidationError exception: {e_str}")
         if "all candidates exhausted with no interior errors" in e_str:
             e_str = "The certificate was not issued by a recognized Mark Verifying Authority (MVA)."
-            validation_errors.append(e_str)
-            valid = False
+        # Every path-validation failure is fatal, regardless of the
+        # verifier's diagnostic wording (RFC 5280 section 6.1.3).
+        validation_errors.append(e_str)
     not_valid_before_timestamp = vmc.not_valid_before_utc.strftime("%Y-%m-%d %H:%M:%SZ")
     not_valid_after_timestamp = vmc.not_valid_after_utc.strftime("%Y-%m-%d %H:%M:%SZ")
     not_yet_valid = datetime.now(timezone.utc) < vmc.not_valid_before_utc
     if not_yet_valid:
-        valid = False
         validation_errors.append(
             f"The certificate is not valid until {not_valid_before_timestamp}"
         )
     expired = datetime.now(timezone.utc) > vmc.not_valid_after_utc
     if expired:
-        valid = False
         validation_errors.append(
             f"The certificate expired on {not_valid_after_timestamp}"
         )
@@ -769,7 +767,6 @@ def get_certificate_metadata(pem_crt: bytes, *, domain=None) -> dict[str, Any]:
                 f"{base_domain} does not match the certificate {plural}: "
                 f"{cert_domains_str}"
             )
-            valid = False
     try:
         cert_issuer = get_cert_name_components(vmc.issuer)
         cert_subject = get_cert_name_components(vmc.subject)
@@ -795,7 +792,6 @@ def get_certificate_metadata(pem_crt: bytes, *, domain=None) -> dict[str, Any]:
                 )
                 for required_field in required_fields:
                     if required_field not in cert_subject:
-                        valid = False
                         validation_errors.append(
                             f"The certificate's subject is missing the required field {required_field}."
                         )
@@ -807,7 +803,6 @@ def get_certificate_metadata(pem_crt: bytes, *, domain=None) -> dict[str, Any]:
                         validation_errors.append(
                             f"At least one of {field_a} or {field_b} is required in the certificate subject."
                         )
-                        valid = False
                 implies_rules: dict[str, str] = {}
                 implies_rules.update(
                     FIELD_REQUIRED_IF_FIELD_IS_PRESENT_BY_MARK_TYPE.get("All", {})
@@ -823,7 +818,6 @@ def get_certificate_metadata(pem_crt: bytes, *, domain=None) -> dict[str, Any]:
                         validation_errors.append(
                             f"{required_field} is required in the certificate subject when {trigger_field} is present."
                         )
-                        valid = False
                 mark_type_fields = (
                     REQUIRED_SUBJECT_FIELDS_BY_MARK_TYPE[mark_type]
                     + OPTIONAL_SUBJECT_FIELDS_BY_MARK_TYPE[mark_type]
@@ -843,14 +837,11 @@ def get_certificate_metadata(pem_crt: bytes, *, domain=None) -> dict[str, Any]:
                             validation_errors.append(
                                 f"The subject {field} is used by {other_mark_type} certificates, not {mark_type} certificates."
                             )
-                            valid = False
             else:
-                valid = False
                 validation_errors.append(
                     f"{cert_subject['markType']} is not a valid subject markType."
                 )
         else:
-            valid = False
             validation_errors.append("markType is missing from the subject.")
 
         metadata["issuer"] = cert_issuer
@@ -859,7 +850,9 @@ def get_certificate_metadata(pem_crt: bytes, *, domain=None) -> dict[str, Any]:
         metadata["not_valid_before"] = not_valid_before_timestamp
         metadata["not_valid_after"] = not_valid_after_timestamp
         metadata["expired"] = expired
-        metadata["valid"] = valid
+        # Required-extension and subject errors are as fatal as a failed
+        # certificate chain; derive the result from one error collection.
+        metadata["valid"] = not validation_errors
         metadata["domains"] = cert_domains
         metadata["logotype_sha256"] = None
         logotype = extract_logo_from_certificate(vmc)
