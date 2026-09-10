@@ -99,26 +99,86 @@ class Test(unittest.TestCase):
         )
 
     def testRFC9989InvalidPsdValue(self):
-        """An invalid psd tag value raises InvalidDMARCTagValue"""
+        """An invalid optional psd value uses the default u."""
         dmarc_record = "v=DMARC1; p=reject; psd=x"
         domain = "example.com"
-        self.assertRaises(
-            checkdmarc.dmarc.InvalidDMARCTagValue,
-            checkdmarc.dmarc.parse_dmarc_record,
-            dmarc_record,
-            domain,
-        )
+        result = checkdmarc.dmarc.parse_dmarc_record(dmarc_record, domain)
+        self.assertEqual(result["tags"]["psd"], {"value": "u", "explicit": False})
+        self.assertTrue(any("default value u" in w for w in result["warnings"]))
 
     def testRFC9989InvalidTValue(self):
-        """An invalid t tag value raises InvalidDMARCTagValue"""
+        """An invalid optional t value uses the default n."""
         dmarc_record = "v=DMARC1; p=reject; t=x"
         domain = "example.com"
-        self.assertRaises(
-            checkdmarc.dmarc.InvalidDMARCTagValue,
-            checkdmarc.dmarc.parse_dmarc_record,
-            dmarc_record,
-            domain,
+        result = checkdmarc.dmarc.parse_dmarc_record(dmarc_record, domain)
+        self.assertEqual(result["tags"]["t"], {"value": "n", "explicit": False})
+        self.assertTrue(any("default value n" in w for w in result["warnings"]))
+
+    def testInvalidOptionalValuesPreservePolicy(self):
+        """Invalid or empty optional values use defaults, including in public checks."""
+        defaults = {"adkim": "r", "aspf": "r", "t": "n", "psd": "u", "fo": "0"}
+        for tag, default in defaults.items():
+            for value in ("", " ", "invalid", "y:n"):
+                with (
+                    self.subTest(tag=tag, value=value),
+                    patch(
+                        "checkdmarc.dmarc.query_dns",
+                        return_value=[
+                            f"v=DMARC1; p=reject; {tag}={value}; sp=quarantine"
+                        ],
+                    ),
+                ):
+                    result = checkdmarc.dmarc.check_dmarc(
+                        "example.com", include_dmarc_tag_descriptions=True
+                    )
+                self.assertTrue(result["valid"], result)
+                success = cast(Any, result)
+                self.assertEqual(success["tags"]["p"]["value"], "reject")
+                self.assertEqual(success["tags"]["sp"]["value"], "quarantine")
+                self.assertEqual(success["tags"][tag]["value"], default)
+                self.assertFalse(success["tags"][tag]["explicit"])
+                self.assertIn("description", success["tags"][tag])
+                self.assertTrue(any("default value" in w for w in success["warnings"]))
+
+    def testFoInvalidListUsesWholeDefault(self):
+        """An invalid member or empty segment discards the entire fo value."""
+        for value in ("d:x", "1:", ":d", "d::s", "1:0:s", "s:1:s"):
+            with self.subTest(value=value):
+                result = checkdmarc.dmarc.parse_dmarc_record(
+                    f"v=DMARC1; p=reject; fo={value}", "example.com"
+                )
+                self.assertEqual(
+                    result["tags"]["fo"], {"value": "0", "explicit": False}
+                )
+                self.assertTrue(any(f"fo={value}" in w for w in result["warnings"]))
+
+    def testValidOptionalValuesStayExplicit(self):
+        """Valid case-insensitive flags and fo lists retain their requested values."""
+        for value in ("D", "S:D", "D:1:S", "S:D:0"):
+            with self.subTest(value=value):
+                result = checkdmarc.dmarc.parse_dmarc_record(
+                    f"v=DMARC1; p=reject; t=Y; psd=N; adkim=S; aspf=S; fo={value}",
+                    "example.com",
+                )
+                for tag, expected in (
+                    ("t", "y"),
+                    ("psd", "n"),
+                    ("adkim", "s"),
+                    ("aspf", "s"),
+                    ("fo", value.lower()),
+                ):
+                    self.assertEqual(
+                        result["tags"][tag], {"value": expected, "explicit": True}
+                    )
+
+    def testEmptyUnknownTagIsIgnored(self):
+        """Section 4.8 also ignores an unknown field with an empty value."""
+        result = checkdmarc.dmarc.parse_dmarc_record(
+            "v=DMARC1; p=reject; extension=", "example.com"
         )
+        self.assertNotIn("extension", result["tags"])
+        self.assertEqual(result["tags"]["p"]["value"], "reject")
+        self.assertTrue(any("extension" in w for w in result["warnings"]))
 
     def testRFC9989PctRemovedWarning(self):
         """A warning is issued when the removed pct tag is used"""
@@ -420,15 +480,12 @@ class Test(unittest.TestCase):
         self.assertIn(checkdmarc.dmarc.SYNTAX_ERROR_MARKER, message)
 
     def testDMARCSyntaxError(self):
-        """An invalid DMARC fo tag value raises InvalidDMARCTagValue"""
+        """An unrecognized fo value uses the default with a warning."""
         dmarc_record = "v=DMARC1; p=reject; fo=invalid_value"
         domain = "example.com"
-        self.assertRaises(
-            checkdmarc.dmarc.InvalidDMARCTagValue,
-            checkdmarc.dmarc.parse_dmarc_record,
-            dmarc_record,
-            domain,
-        )
+        result = checkdmarc.dmarc.parse_dmarc_record(dmarc_record, domain)
+        self.assertEqual(result["tags"]["fo"], {"value": "0", "explicit": False})
+        self.assertTrue(any("fo=invalid_value" in w for w in result["warnings"]))
 
     def testDMARCDuplicateTags(self):
         """Duplicate DMARC tags raise InvalidDMARCTag"""
@@ -500,15 +557,12 @@ class Test(unittest.TestCase):
         self.assertTrue(any("at most once" in w for w in result["warnings"]))
 
     def testDMARCInvalidFoValue(self):
-        """Invalid fo tag value raises InvalidDMARCTagValue"""
+        """An invalid optional fo value uses the default 0."""
         dmarc_record = "v=DMARC1; p=reject; fo=x"
         domain = "example.com"
-        self.assertRaises(
-            checkdmarc.dmarc.InvalidDMARCTagValue,
-            checkdmarc.dmarc.parse_dmarc_record,
-            dmarc_record,
-            domain,
-        )
+        result = checkdmarc.dmarc.parse_dmarc_record(dmarc_record, domain)
+        self.assertEqual(result["tags"]["fo"], {"value": "0", "explicit": False})
+        self.assertTrue(any("fo=x" in w for w in result["warnings"]))
 
     def testDMARCRfRemovedNotValidated(self):
         """rf values that would have been rejected pre-9989 now just warn"""

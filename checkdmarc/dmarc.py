@@ -50,8 +50,10 @@ logger = logging.getLogger(__name__)
 DMARC_VERSION_REGEX_STRING = rf"[vV]{WSP_REGEX}*={WSP_REGEX}*DMARC1"
 # RFC 9989 §4.8: a tag name is 1*ALPHA (any length), and a tag value may
 # contain any printing character except a semicolon (%x20-3A / %x3C-7E).
+# Collect empty values too so invalid optional values can use their
+# defaults under section 4.8 rather than aborting the whole record.
 DMARC_TAG_VALUE_REGEX_STRING = (
-    rf"([a-z]+){WSP_REGEX}*={WSP_REGEX}*([\x20-\x3a\x3c-\x7e]+)"
+    rf"([a-z]+){WSP_REGEX}*={WSP_REGEX}*([\x20-\x3a\x3c-\x7e]*)"
 )
 DMARC_SEPARATOR_REGEX_STRING = rf"{WSP_REGEX}*;{WSP_REGEX}*"
 
@@ -1585,6 +1587,8 @@ def parse_dmarc_record(
         explicit = tags[tag]["explicit"]
         if "values" in dmarc_tags[tag]:
             allowed_values = dmarc_tags[tag]["values"]
+        elif tag in ("adkim", "aspf"):
+            allowed_values = ["r", "s"]
         if tag == "p" and tag_value == "none":
             warnings.append(
                 f"A p tag value of none makes DMARC unenforced on email sent as {domain}."
@@ -1593,37 +1597,37 @@ def parse_dmarc_record(
             warnings.append(
                 f"An sp tag value of none makes DMARC unenforced on email sent as a subdomain of {domain}."
             )
-        if tag in ("adkim", "aspf") and tag_value not in ("r", "s"):
+        if tag in ("adkim", "aspf", "t", "psd") and tag_value not in allowed_values:
             # RFC 9989 §4.8: syntax errors in a tag value are discarded in
-            # favor of the default value, so an invalid alignment mode
-            # falls back to relaxed (r) rather than failing the record.
+            # favor of its default value. Invalid optional alignment,
+            # test-mode, and PSD flags do not invalidate the policy.
+            default_value = dmarc_tags[tag]["default"]
+            allowed_values_str = " or ".join(allowed_values)
             warnings.append(
-                f"{tag_value} is not a valid {tag} tag value (must be r "
-                "or s); the default value r was used instead, because "
+                f"{tag_value} is not a valid {tag} tag value (must be "
+                f"{allowed_values_str}); the default value {default_value} "
+                "was used instead, because "
                 "RFC 9989 § 4.8 requires discarding an invalid value in "
                 "favor of the default."
             )
-            tags[tag] = {"value": "r", "explicit": False}
+            tags[tag] = {"value": default_value, "explicit": False}
         elif tag == "fo":
             fo_options = tag_value.split(":")
-            for value in fo_options:
-                if value not in allowed_values:
-                    raise InvalidDMARCTagValue(
-                        f"{value} is not a valid option for the DMARC fo tag."
-                    )
             # RFC 9989 §4.7: "0" and "1" are mutually exclusive, and the
             # §4.8 ABNF allows each value to appear at most once, so a
             # list that breaks either rule is a syntax error. Per §4.8 the
             # invalid value is discarded in favor of the default ("0").
             invalid_fo_reason = None
-            if "0" in fo_options and "1" in fo_options:
+            if any(value not in allowed_values for value in fo_options):
+                invalid_fo_reason = "options must be 0, 1, d, or s"
+            elif "0" in fo_options and "1" in fo_options:
                 invalid_fo_reason = "the 0 and 1 values are mutually exclusive"
             elif len(fo_options) != len(set(fo_options)):
                 invalid_fo_reason = "each value may appear at most once"
             if invalid_fo_reason is not None:
                 warnings.append(
                     f"fo={tag_value} is invalid ({invalid_fo_reason} per "
-                    "RFC 9989 § 4.7); the default value fo=0 was used "
+                    "RFC 9989 § 4.8); the default value fo=0 was used "
                     "instead."
                 )
                 tags["fo"] = {"value": "0", "explicit": False}
