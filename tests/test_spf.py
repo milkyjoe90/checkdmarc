@@ -930,6 +930,35 @@ class TestSPFRedirect(unittest.TestCase):
 
 
 class TestSPFExpModifier(unittest.TestCase):
+    def testExplanationTextAllowsExpOnlyMacros(self):
+        """The fetched explanation permits c/r/t, unlike its DNS selector."""
+        with patch(
+            "checkdmarc.spf.get_txt_records",
+            return_value=["Client %{c} rejected by %{r} at %{t}; %{S} %% %_ %-"],
+        ):
+            result = checkdmarc.spf.parse_spf_record(
+                "v=spf1 -all exp=explain.example.com", "example.com"
+            )
+        self.assertEqual(result["parsed"]["exp"], "explain.example.com")
+        self.assertEqual(result["parsed"]["all"], "fail")
+        self.assertEqual(result["dns_lookups"], 0)
+        self.assertEqual(result["warnings"], [])
+
+    def testInvalidExplanationTextDoesNotInvalidatePolicy(self):
+        """RFC 7208 section 6.2 ignores invalid explanation TXT syntax."""
+        for explanation in ("Bad %", "%{z}", "%{d0}", "non-ASCII é", "bad\nline"):
+            with (
+                self.subTest(explanation=explanation),
+                patch("checkdmarc.spf.get_txt_records", return_value=[explanation]),
+            ):
+                result = checkdmarc.spf.parse_spf_record(
+                    "v=spf1 -all exp=explain.example.com", "example.com"
+                )
+            self.assertNotIn("error", result)
+            self.assertEqual(result["parsed"]["all"], "fail")
+            self.assertEqual(result["dns_lookups"], 0)
+            self.assertTrue(any("would be ignored" in w for w in result["warnings"]))
+
     def testExpAfterAllValidDomain(self):
         """exp=domain.example after -all is looked up but doesn't count for limits"""
         with patch("checkdmarc.spf.get_txt_records", return_value=["explanation"]):
@@ -1724,6 +1753,9 @@ class TestRFC7208Conformance(unittest.TestCase):
             "v=spf1 a:%{r}.example.com -all",
             "v=spf1 include:%{t}.example.com -all",
             "v=spf1 redirect=%{c}.example.com",
+            "v=spf1 -all exp=%{c}.explain.example.com",
+            "v=spf1 exp=%{r}.explain.example.com -all",
+            "v=spf1 -all exp=%{t}.explain.example.com",
         ):
             with self.subTest(record=record):
                 self.assertRaises(
@@ -1732,11 +1764,44 @@ class TestRFC7208Conformance(unittest.TestCase):
                     record,
                     "example.com",
                 )
-        # ...but they are accepted in exp values
-        result = checkdmarc.spf.parse_spf_record(
-            "v=spf1 -all exp=%{c}.explain.example.com", "example.com"
-        )
-        self.assertEqual(result["parsed"]["exp"], "%{c}.explain.example.com")
+
+    def testMalformedModifierMacrosFailBeforeDns(self):
+        """Unknown modifiers still require macro-string syntax, anywhere in the record."""
+        for value in ("%", "%z", "%{z}", "%{}", "%{d0}", "%{d", "%{d!}"):
+            for modifier in ("extension", "exp"):
+                for after_all in (False, True):
+                    term = f"{modifier}={value}"
+                    terms = f"a -all {term}" if after_all else f"a {term} -all"
+                    with (
+                        self.subTest(
+                            value=value, modifier=modifier, after_all=after_all
+                        ),
+                        patch(
+                            "checkdmarc.spf.get_a_records",
+                            side_effect=AssertionError("Unexpected DNS"),
+                        ),
+                        patch(
+                            "checkdmarc.spf.get_txt_records",
+                            side_effect=AssertionError("Unexpected DNS"),
+                        ),
+                        self.assertRaises(checkdmarc.spf.SPFSyntaxError),
+                    ):
+                        checkdmarc.spf.parse_spf_record(
+                            f"v=spf1 {terms}", "example.com"
+                        )
+
+    def testValidUnknownModifierMacrosAreIgnored(self):
+        """Well-formed unknown values are ignored, including escapes and empty values."""
+        for value in ("", "plain", "%%", "%_", "%-", "%{S}", "%{i3R.-}"):
+            with self.subTest(value=value):
+                result = checkdmarc.spf.parse_spf_record(
+                    f"v=spf1 extension={value} -all extension={value}", "example.com"
+                )
+            self.assertEqual(result["dns_lookups"], 0)
+            self.assertEqual(result["parsed"]["all"], "fail")
+            self.assertTrue(
+                any("unknown modifier extension" in w for w in result["warnings"])
+            )
 
     def testUppercaseRTransformerAccepted(self):
         """The r transformer matches case-insensitively (RFC 5234

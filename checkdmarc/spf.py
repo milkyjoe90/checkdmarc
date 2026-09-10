@@ -852,20 +852,14 @@ def parse_spf_record(
         return domain_part, ip4_cidr, ip6_cidr
 
     def _check_exp_value(exp_value: str) -> None:
-        """Validate an exp value: macro syntax, or the TXT record behind it.
+        """Check the explanation TXT record behind a literal exp target.
 
         RFC 7208 section 6.2: the explanation TXT lookup happens at
         evaluation time and never counts toward the DNS lookup limits.
         """
         if "%" in exp_value:
-            # RFC 7208 section 7.2 allows the c, r, and t macro letters in
-            # explanation text.
-            _validate_spf_macros(
-                exp_value,
-                domain,
-                syntax_error_marker,
-                allow_exp_only_letters=True,
-            )
+            # The first pass already checked the domain-spec syntax.
+            # Expanding this target requires the SMTP sender context.
             return
         try:
             exp_txt_records = get_txt_records(
@@ -878,6 +872,28 @@ def parse_spf_record(
                 warnings.append(f"No TXT records at exp value {exp_value}.")
             if len(exp_txt_records) > 1:
                 warnings.append(f"Too many TXT records at exp value {exp_value}.")
+            if len(exp_txt_records) == 1:
+                explanation = exp_txt_records[0]
+                try:
+                    # RFC 7208 sections 6.2 and 7.1: the fetched TXT is an
+                    # explain-string, which permits spaces and the c/r/t
+                    # macros that are forbidden in the exp domain-spec.
+                    if any(not 0x20 <= ord(char) <= 0x7E for char in explanation):
+                        raise SPFSyntaxError("Explanation text must be printable ASCII")
+                    _validate_spf_macros(
+                        explanation,
+                        domain,
+                        syntax_error_marker,
+                        allow_exp_only_letters=True,
+                    )
+                except SPFSyntaxError as explanation_error:
+                    # An invalid explanation does not invalidate the SPF
+                    # policy; receivers ignore it under section 6.2.
+                    warnings.append(
+                        f"The explanation TXT record at {exp_value} is invalid "
+                        "and would be ignored (RFC 7208 § 6.2): "
+                        f"{explanation_error}"
+                    )
         except DNSException as e:
             warnings.append(f"Failed to get TXT records at exp value {exp_value}: {e}")
 
@@ -1025,9 +1041,10 @@ def parse_spf_record(
             elif name == "exp":
                 if value == "":
                     raise SPFSyntaxError("The exp modifier is missing a value")
-                _validate_spf_macros(
-                    raw_value, domain, syntax_error_marker, allow_exp_only_letters=True
-                )
+                # RFC 7208 section 6.2 uses domain-spec here. The c, r,
+                # and t macros are allowed only in the fetched explanation
+                # text, not in the DNS target (section 7.2).
+                _validate_spf_macros(raw_value, domain, syntax_error_marker)
             elif name in RFC6652_MODIFIERS:
                 # ra=, rp=, and rr= are reporting modifiers defined by RFC 6652
                 # § 3. Their validation needs no DNS work, so they are not
@@ -1035,6 +1052,10 @@ def parse_spf_record(
                 _record_rfc6652_modifier(name, raw_value)
                 continue
             else:
+                # RFC 7208 sections 4.6.1 and 7.1 require macro-string
+                # syntax even for unknown modifiers. Ignore their meaning
+                # only after validating the entire record, before DNS.
+                _validate_spf_macros(raw_value, domain, syntax_error_marker)
                 # RFC 7208 section 6: "Unrecognized modifiers MUST be
                 # ignored no matter where, or how often, they appear in a
                 # record."
