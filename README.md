@@ -17,7 +17,7 @@ Please consider [sponsoring my work](https://github.com/sponsors/seanthegeek) if
 - API, CLI, and web interfaces
 - Can test multiple domains at once
 - CLI output in JSON or CSV format
-- DNSSEC validation
+- DNSSEC signatures authenticated through parent zones to bundled IANA root keys
 - SPF
   - Record validation
   - Counting of DNS lookups and void lookups
@@ -39,6 +39,19 @@ Please consider [sponsoring my work](https://github.com/sponsors/seanthegeek) if
   - Record and policy parsing and validation
 - SOA record parsing
 - Nameserver listing
+
+## DNSSEC results
+
+`dnssec: true` means at least one checked record set was authenticated through
+its parent zones to a bundled IANA root trust anchor. Keep the package current
+for root key rollovers. Cached answers expire at the earliest DNS TTL or
+signature expiration in that chain and are isolated by nameserver configuration.
+
+`false` does not distinguish unsigned DNS, invalid signatures, and failed
+lookups. The check does not authenticate denial of existence or wildcard
+expansion. `tlsa` contains only authenticated records at the exact queried name;
+CNAME/DNAME aliases and wildcard answers are not followed by this lookup.
+The raw `get_dnskey()` library helper returns keys without authenticating them.
 
 ## Docker support
 

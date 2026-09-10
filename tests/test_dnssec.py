@@ -1,6 +1,7 @@
 """Tests for checkdmarc.dnssec"""
 
 import os
+import time
 import unittest
 from typing import ClassVar, cast
 from unittest.mock import MagicMock, patch
@@ -46,7 +47,7 @@ def _rrsig(
         300,
         "IN",
         "RRSIG",
-        f"{covered_type} 13 2 300 20990101000000 20200101000000 1234 {signer} ab==",
+        f"{covered_type} 13 {len(dns.name.from_text(name).labels) - 1} 300 20990101000000 20200101000000 1234 {signer} ab==",
     )
 
 
@@ -203,10 +204,14 @@ class Test(unittest.TestCase):
         )
 
     @mocked_only
-    def testDNSSECMocked(self):
+    @patch("checkdmarc.dnssec._authenticate_zone_keys")
+    def testDNSSECMocked(self, authenticate):
         """check_dnssec returns True when the DS, DNSKEY, and signature all
         line up (mocked network, real cryptography)"""
         ds, key, sig = _signed_zone("example.com.")
+        authenticate.return_value = checkdmarc.dnssec._AuthenticatedKeys(
+            key, time.time() + 300
+        )
         with patch(
             "dns.query.tcp",
             side_effect=[_response(ds), _response(key, sig)],
@@ -225,12 +230,18 @@ class Test(unittest.TestCase):
         self.assertFalse(result)
 
     def testGetDnskeyCache(self):
-        """get_dnskey uses cache"""
+        """A resolved DNSKEY stays available during its TTL for that resolver."""
         cache = _fresh_cache()
-        mock_key = {"test": "data"}
-        cache["example.com"] = mock_key
-        result = checkdmarc.dnssec.get_dnskey("example.com", cache=cache)
-        self.assertEqual(result, mock_key)
+        key = dns.rrset.from_text("example.com.", 300, "IN", "DNSKEY", DNSKEY_RDATA)
+        with patch("dns.query.tcp", return_value=_response(key)):
+            checkdmarc.dnssec.get_dnskey(
+                "example.com", nameservers=["192.0.2.1"], cache=cache
+            )
+        with patch("dns.query.tcp", side_effect=OSError("offline")):
+            result = checkdmarc.dnssec.get_dnskey(
+                "example.com", nameservers=["192.0.2.1"], cache=cache
+            )
+        self.assertEqual(result, {dns.name.from_text("example.com."): key})
 
 
 class TestGetDnskey(unittest.TestCase):
@@ -299,9 +310,11 @@ class TestGetDnskey(unittest.TestCase):
             checkdmarc.dnssec.get_dnskey(
                 "sub.example.com", nameservers=["1.1.1.1"], cache=cache
             )
-        self.assertEqual(
-            cache["example.com"], {dns.name.from_text("example.com."): key}
-        )
+        with patch("dns.query.tcp", side_effect=OSError("offline")):
+            cached = checkdmarc.dnssec.get_dnskey(
+                "example.com", nameservers=["1.1.1.1"], cache=cache
+            )
+        self.assertEqual(cached, {dns.name.from_text("example.com."): key})
         self.assertNotIn("example.com", checkdmarc.dnssec.DNSKEY_CACHE)
 
     def testQueryExceptionIsNotCached(self):
@@ -330,7 +343,11 @@ class TestGetDnskey(unittest.TestCase):
                 "example.com", nameservers=["192.0.2.1", "192.0.2.2"], cache=cache
             )
         self.assertIsNotNone(result)
-        self.assertIn("example.com", cache)
+        with patch("dns.query.tcp", side_effect=OSError("offline")):
+            cached = checkdmarc.dnssec.get_dnskey(
+                "example.com", nameservers=["192.0.2.1", "192.0.2.2"], cache=cache
+            )
+        self.assertEqual(cached, result)
 
     def testAllNameserversRefusedIsNotCached(self):
         """When every nameserver refuses, the result is a failed lookup
@@ -367,33 +384,32 @@ class TestCheckDnssec(unittest.TestCase):
     the zone apex — MX, A, NS, and CNAME at the domain itself.
     """
 
-    def testCacheHitTrue(self):
+    def testUnscopedBooleanCacheIsNotTrusted(self):
         cache = _fresh_cache()
         cache["example.com"] = True
-        with patch("dns.query.tcp") as query:
-            result = checkdmarc.dnssec.check_dnssec("example.com", cache=cache)
-        self.assertTrue(result)
-        self.assertFalse(query.called)
-
-    def testCacheHitFalse(self):
-        cache = _fresh_cache()
-        cache["example.com"] = False
-        result = checkdmarc.dnssec.check_dnssec("example.com", cache=cache)
+        with patch("dns.query.tcp", return_value=_response()):
+            result = checkdmarc.dnssec.check_dnssec(
+                "example.com", nameservers=["192.0.2.1"], cache=cache
+            )
         self.assertFalse(result)
 
-    def testValidChainReturnsTrue(self):
+    @patch("checkdmarc.dnssec._authenticate_zone_keys")
+    def testValidChainReturnsTrue(self, authenticate):
         """DS present, a DNSKEY matching it, and a verifying signature: True
 
-        Real cryptography end to end; nothing but the network is mocked.
+        The parent-chain result is supplied; local signature verification is real.
         """
         cache = _fresh_cache()
         ds, key, sig = _signed_zone("example.com.")
+        authenticate.return_value = checkdmarc.dnssec._AuthenticatedKeys(
+            key, time.time() + 300
+        )
         with patch("dns.query.tcp", side_effect=[_response(ds), _response(key, sig)]):
             result = checkdmarc.dnssec.check_dnssec(
                 "example.com", nameservers=["192.0.2.1"], cache=cache
             )
         self.assertTrue(result)
-        self.assertIs(cache["example.com"], True)
+        self.assertNotIn("example.com", cache)
 
     def testIslandOfSecurityReturnsFalse(self):
         """A self-consistent signed DNSKEY with no DS at the parent: False
@@ -412,7 +428,7 @@ class TestCheckDnssec(unittest.TestCase):
                 "example.com", nameservers=["192.0.2.1"], cache=cache
             )
         self.assertFalse(result)
-        self.assertIs(cache["example.com"], False)
+        self.assertNotIn("example.com", cache)
         self.assertTrue(any("no DS record" in line for line in logs.output))
 
     def testNoDsNoDnskeyReturnsFalse(self):
@@ -545,7 +561,8 @@ class TestCheckDnssec(unittest.TestCase):
             )
         self.assertFalse(result)
 
-    def testSubdomainWithSignedRecordReturnsTrue(self):
+    @patch("checkdmarc.dnssec._authenticate_zone_keys")
+    def testSubdomainWithSignedRecordReturnsTrue(self, authenticate):
         """A name below a signed zone apex whose own records verify: True"""
         ds, key, sig = _signed_zone("example.com.")
         mx_response = _response(
@@ -553,6 +570,9 @@ class TestCheckDnssec(unittest.TestCase):
                 "sub.example.com.", 300, "IN", "MX", "10 mail.example.com."
             ),
             _rrsig("sub.example.com.", "MX"),
+        )
+        authenticate.return_value = checkdmarc.dnssec._AuthenticatedKeys(
+            key, time.time() + 300
         )
         with (
             patch(
@@ -574,7 +594,8 @@ class TestCheckDnssec(unittest.TestCase):
             )
         self.assertTrue(result)
 
-    def testSubdomainWithOnlySignedAaaaReturnsTrue(self):
+    @patch("checkdmarc.dnssec._authenticate_zone_keys")
+    def testSubdomainWithOnlySignedAaaaReturnsTrue(self, authenticate):
         """A name below a signed zone apex whose only record set is a
         signed AAAA must count as covered, not fall off the end of the
         record-type list"""
@@ -582,6 +603,9 @@ class TestCheckDnssec(unittest.TestCase):
         aaaa_response = _response(
             dns.rrset.from_text("sub.example.com.", 300, "IN", "AAAA", "2001:db8::1"),
             _rrsig("sub.example.com.", "AAAA"),
+        )
+        authenticate.return_value = checkdmarc.dnssec._AuthenticatedKeys(
+            key, time.time() + 300
         )
         with (
             patch(
@@ -605,11 +629,15 @@ class TestCheckDnssec(unittest.TestCase):
             )
         self.assertTrue(result)
 
-    def testSubdomainWithUnsignedRecordsReturnsFalse(self):
+    @patch("checkdmarc.dnssec._authenticate_zone_keys")
+    def testSubdomainWithUnsignedRecordsReturnsFalse(self, authenticate):
         """A name below a signed zone apex with no signed records: False"""
         ds, key, sig = _signed_zone("example.com.")
         a_response = _response(
             dns.rrset.from_text("sub.example.com.", 300, "IN", "A", "192.0.2.1")
+        )
+        authenticate.return_value = checkdmarc.dnssec._AuthenticatedKeys(
+            key, time.time() + 300
         )
         with (
             patch(
@@ -636,7 +664,8 @@ class TestCheckDnssec(unittest.TestCase):
             any("no signed records were found" in line for line in logs.output)
         )
 
-    def testSubdomainBadRecordSignatureIsWarnedAndSkipped(self):
+    @patch("checkdmarc.dnssec._authenticate_zone_keys")
+    def testSubdomainBadRecordSignatureIsWarnedAndSkipped(self, authenticate):
         """A record signature below the apex that fails to verify is warned
         about and does not count as signed"""
         ds, key, sig = _signed_zone("example.com.")
@@ -645,6 +674,9 @@ class TestCheckDnssec(unittest.TestCase):
                 "sub.example.com.", 300, "IN", "MX", "10 mail.example.com."
             ),
             _rrsig("sub.example.com.", "MX"),
+        )
+        authenticate.return_value = checkdmarc.dnssec._AuthenticatedKeys(
+            key, time.time() + 300
         )
         with (
             patch(
@@ -669,10 +701,14 @@ class TestCheckDnssec(unittest.TestCase):
         self.assertFalse(result)
         self.assertTrue(any("does not verify" in line for line in logs.output))
 
-    def testSubdomainServfailBelowSignedZoneReturnsFalse(self):
+    @patch("checkdmarc.dnssec._authenticate_zone_keys")
+    def testSubdomainServfailBelowSignedZoneReturnsFalse(self, authenticate):
         """SERVFAIL on a record query below a signed zone is warned about as
         a broken zone rather than treated as an unsigned record"""
         ds, key, sig = _signed_zone("example.com.")
+        authenticate.return_value = checkdmarc.dnssec._AuthenticatedKeys(
+            key, time.time() + 300
+        )
         with (
             patch(
                 "dns.query.tcp",
@@ -728,13 +764,17 @@ class TestCheckDnssec(unittest.TestCase):
             )
         self.assertFalse(result)
 
-    def testAdFlagLogged(self):
+    @patch("checkdmarc.dnssec._authenticate_zone_keys")
+    def testAdFlagLogged(self, authenticate):
         """A resolver-validated (AD-flagged) DNSKEY answer is noted in the
         debug log and the chain still validates"""
         cache = _fresh_cache()
         ds, key, sig = _signed_zone("example.com.")
         key_response = _response(key, sig)
         key_response.flags = dns.flags.AD
+        authenticate.return_value = checkdmarc.dnssec._AuthenticatedKeys(
+            key, time.time() + 300
+        )
         with (
             patch("dns.query.tcp", side_effect=[_response(ds), key_response]),
             self.assertLogs("checkdmarc.dnssec", level="DEBUG") as logs,
@@ -745,14 +785,16 @@ class TestCheckDnssec(unittest.TestCase):
         self.assertTrue(result)
         self.assertTrue(any("AD flag" in line for line in logs.output), logs.output)
 
-    def testIntermediateSignedZoneWalk(self):
+    @patch("checkdmarc.dnssec._authenticate_zone_keys")
+    def testIntermediateSignedZoneWalk(self, authenticate):
         """A delegated signed zone between the queried name and the base
         domain anchors validation, instead of being skipped for the base
         domain's keys
 
         www.signed-child.example.com has no DS of its own; the walk must
         stop at signed-child.example.com (which has one) rather than
-        jumping to example.com. Real cryptography end to end.
+        jumping to example.com. The local signatures use real cryptography;
+        the separately tested parent-chain check supplies authenticated keys.
         """
         cache = _fresh_cache()
         private_key = ec.generate_private_key(ec.SECP256R1())
@@ -778,6 +820,9 @@ class TestCheckDnssec(unittest.TestCase):
             www,
             300,
             dns.dnssec.sign(a_rrset, private_key, zone, dnskey, lifetime=3600),
+        )
+        authenticate.return_value = checkdmarc.dnssec._AuthenticatedKeys(
+            key_rrset, time.time() + 300
         )
         with patch(
             "dns.query.tcp",
@@ -822,10 +867,15 @@ class TestGetTlsaRecords(unittest.TestCase):
                 side_effect=[OSError("unreachable"), _response(tlsa, sig)],
             ),
             patch(
-                "checkdmarc.dnssec.get_dnskey",
-                return_value={dns.name.from_text("mail.example.com."): "key"},
+                "checkdmarc.dnssec._authenticate_zone_keys",
+                return_value=checkdmarc.dnssec._AuthenticatedKeys(
+                    dns.rrset.from_text(
+                        "example.com.", 300, "IN", "DNSKEY", DNSKEY_RDATA
+                    ),
+                    time.time() + 300,
+                ),
             ),
-            patch("dns.dnssec.validate", return_value=None),
+            patch("dns.dnssec.validate_rrsig", return_value=None),
         ):
             result = checkdmarc.dnssec.get_tlsa_records(
                 "mail.example.com", nameservers=["192.0.2.1", "192.0.2.2"], cache=cache
@@ -848,10 +898,15 @@ class TestGetTlsaRecords(unittest.TestCase):
                 ],
             ),
             patch(
-                "checkdmarc.dnssec.get_dnskey",
-                return_value={dns.name.from_text("mail.example.com."): "key"},
+                "checkdmarc.dnssec._authenticate_zone_keys",
+                return_value=checkdmarc.dnssec._AuthenticatedKeys(
+                    dns.rrset.from_text(
+                        "example.com.", 300, "IN", "DNSKEY", DNSKEY_RDATA
+                    ),
+                    time.time() + 300,
+                ),
             ),
-            patch("dns.dnssec.validate", return_value=None),
+            patch("dns.dnssec.validate_rrsig", return_value=None),
         ):
             result = checkdmarc.dnssec.get_tlsa_records(
                 "mail.example.com",
@@ -887,11 +942,16 @@ class TestGetTlsaRecords(unittest.TestCase):
         with (
             patch("dns.query.tcp", return_value=_response(tlsa, sig)),
             patch(
-                "checkdmarc.dnssec.get_dnskey",
-                return_value={dns.name.from_text("mail.example.com."): "key"},
+                "checkdmarc.dnssec._authenticate_zone_keys",
+                return_value=checkdmarc.dnssec._AuthenticatedKeys(
+                    dns.rrset.from_text(
+                        "example.com.", 300, "IN", "DNSKEY", DNSKEY_RDATA
+                    ),
+                    time.time() + 300,
+                ),
             ),
             patch(
-                "dns.dnssec.validate",
+                "dns.dnssec.validate_rrsig",
                 side_effect=dns.exception.ValidationFailure("bad signature"),
             ),
         ):
@@ -901,20 +961,14 @@ class TestGetTlsaRecords(unittest.TestCase):
         self.assertEqual(result, [])
         self.assertNotIn("_25._tcp.mail.example.com", cache)
 
-    def testCacheHit(self):
-        """A cached result is returned from the cache the caller passed in
-
-        The lookup must read the caller's cache, not the module-level one, and
-        must not reach the network to do it.
-        """
+    def testUnscopedTlsaCacheIsNotTrusted(self):
         cache = _fresh_cache()
-        cache["_25._tcp.mail.example.com"] = ["cached"]
-        with patch("dns.query.tcp") as query:
+        cache["_25._tcp.mail.example.com"] = ["untrusted"]
+        with patch("dns.query.tcp", return_value=_response()):
             result = checkdmarc.dnssec.get_tlsa_records(
                 "mail.example.com", nameservers=["1.1.1.1"], cache=cache
             )
-        self.assertEqual(result, ["cached"])
-        self.assertFalse(query.called)
+        self.assertEqual(result, [])
 
     def testModuleCacheNotConsultedWhenCallerPassesOne(self):
         """A stale module-level entry must not leak into a caller's own cache"""
@@ -969,7 +1023,7 @@ class TestGetTlsaRecords(unittest.TestCase):
         )
         with (
             patch("dns.query.tcp", return_value=response),
-            patch("checkdmarc.dnssec.get_dnskey", return_value=None),
+            patch("checkdmarc.dnssec._authenticate_zone_keys", return_value=None),
         ):
             result = checkdmarc.dnssec.get_tlsa_records(
                 "mail.example.com", nameservers=["1.1.1.1"], cache=_fresh_cache()
@@ -987,14 +1041,26 @@ class TestGetTlsaRecords(unittest.TestCase):
         )
         with (
             patch("dns.query.tcp", return_value=response),
-            patch("checkdmarc.dnssec.get_dnskey", return_value=MagicMock()),
-            patch("dns.dnssec.validate", return_value=None),
+            patch(
+                "checkdmarc.dnssec._authenticate_zone_keys",
+                return_value=checkdmarc.dnssec._AuthenticatedKeys(
+                    dns.rrset.from_text(
+                        "example.com.", 300, "IN", "DNSKEY", DNSKEY_RDATA
+                    ),
+                    time.time() + 300,
+                ),
+            ),
+            patch("dns.dnssec.validate_rrsig", return_value=None),
         ):
             result = checkdmarc.dnssec.get_tlsa_records(
                 "mail.example.com", nameservers=["1.1.1.1"], cache=cache
             )
         self.assertEqual(result, [TLSA_RDATA])
-        self.assertEqual(cache["_25._tcp.mail.example.com"], [TLSA_RDATA])
+        with patch("dns.query.tcp", side_effect=OSError("offline")):
+            cached = checkdmarc.dnssec.get_tlsa_records(
+                "mail.example.com", nameservers=["1.1.1.1"], cache=cache
+            )
+        self.assertEqual(cached, [TLSA_RDATA])
 
     def testQueryExceptionReturnsEmpty(self):
         with patch("dns.query.tcp", side_effect=OSError("boom")):

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import time
 import warnings
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import dns.dnssec
 import dns.exception
@@ -29,6 +31,9 @@ from checkdmarc._constants import (
     DNSSEC_CACHE_MAX_LEN,
 )
 from checkdmarc.utils import (
+    _cache_dns,
+    _get_cached_dns,
+    _nameserver_cache_key,
     _nameservers_to_resolver_input,
     get_base_domain,
     normalize_domain,
@@ -59,6 +64,131 @@ DNSKEY_CACHE = ExpiringDict(
 TLSA_CACHE = ExpiringDict(
     max_len=DNSSEC_CACHE_MAX_LEN, max_age_seconds=DNSSEC_CACHE_MAX_AGE_SECONDS
 )
+
+
+# Current and successor IANA root KSKs, verified against
+# https://data.iana.org/root-anchors/root-anchors.xml on 2026-09-10.
+# Both validFrom dates have passed and neither has a validUntil date.
+# Refresh these anchors with package releases when IANA announces rollovers
+# (RFC 9718 sections 3.2 and 4.1.1); never learn a trust anchor from DNS.
+_ROOT_DS = dns.rrset.from_text(
+    ".",
+    0,
+    "IN",
+    "DS",
+    "20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D",
+    "38696 8 2 683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16",
+)
+
+
+@dataclass(frozen=True)
+class _AuthenticatedKeys:
+    rrset: dns.rrset.RRset
+    expires_at: float
+
+
+def _dnssec_cache_key(
+    kind: str, domain: str, nameservers: Sequence[str | Nameserver]
+) -> tuple:
+    return (
+        kind,
+        normalize_domain(domain).rstrip("."),
+        _nameserver_cache_key(nameservers),
+    )
+
+
+def _signature_expiration(rrset: dns.rrset.RRset, signatures: dns.rrset.RRset) -> float:
+    # RFC 4035 section 5.3.3 limits authenticated cache lifetime by the
+    # record/signature TTLs, original TTL, and signature expiration.
+    now = time.time()
+    return min(
+        now + rrset.ttl,
+        now + signatures.ttl,
+        *(min(now + sig.original_ttl, sig.expiration) for sig in signatures),
+    )
+
+
+def _authenticate_zone_keys(
+    zone: dns.name.Name,
+    nameservers: Sequence[str | Nameserver],
+    timeout: float,
+    cache: ExpiringDict,
+) -> _AuthenticatedKeys | None:
+    """Authenticate a zone's keys through parent signatures to the IANA root."""
+    cache_key = (
+        _dnssec_cache_key("authenticated-key", zone.to_text(), nameservers),
+        tuple(str(ds) for ds in _ROOT_DS),
+    )
+    cached = _get_cached_dns(cache, cache_key)
+    if isinstance(cached, _AuthenticatedKeys):
+        return cached
+    keys, key_signature, response = _query_rrset(
+        zone.to_text(), RdataType.DNSKEY, nameservers, timeout
+    )
+    if keys is None or key_signature is None or response is None:
+        return None
+    if response.rcode() != dns.rcode.NOERROR:
+        return None
+    keys_expiration = _signature_expiration(keys, key_signature)
+    parent_expiration = float("inf")
+    if zone == dns.name.root:
+        ds_records = _ROOT_DS
+    else:
+        ds_records, ds_signatures, response = _query_rrset(
+            zone.to_text(), RdataType.DS, nameservers, timeout
+        )
+        if ds_records is None or ds_signatures is None or response is None:
+            return None
+        if response.rcode() != dns.rcode.NOERROR:
+            return None
+        ds_expiration = _signature_expiration(ds_records, ds_signatures)
+        authenticated_parent = False
+        for signature in ds_signatures:
+            # RFC 4035 section 5.2: DS is signed by the *parent* zone.
+            # Strict ancestry also bounds recursion and rejects self-signed
+            # DS records or cycles supplied by an untrusted resolver.
+            parent = signature.signer
+            if (
+                parent == zone
+                or not zone.is_subdomain(parent)
+                or signature.labels != len(zone.labels) - 1
+            ):
+                continue
+            parent_keys = _authenticate_zone_keys(parent, nameservers, timeout, cache)
+            if parent_keys is None:
+                continue
+            try:
+                dns.dnssec.validate_rrsig(
+                    ds_records, signature, {parent: parent_keys.rrset}
+                )
+            except (
+                dns.exception.ValidationFailure,
+                dns.exception.UnsupportedAlgorithm,
+            ):
+                continue
+            parent_expiration = min(parent_keys.expires_at, ds_expiration)
+            authenticated_parent = True
+            break
+        if not authenticated_parent:
+            return None
+    trusted_keys = _ds_matched_keys(zone, ds_records, keys)
+    if not trusted_keys:
+        return None
+    # A zone's DNSKEY RRset must be signed by a matching zone key, rather
+    # than by a same-tag key belonging to a different name.
+    valid_signatures = dns.rrset.RRset(zone, dns.rdataclass.IN, RdataType.RRSIG)
+    for signature in key_signature:
+        if signature.signer == zone and signature.labels == len(zone.labels) - 1:
+            valid_signatures.add(signature)
+    if not valid_signatures:
+        return None
+    try:
+        dns.dnssec.validate(keys, valid_signatures, {zone: trusted_keys})
+    except dns.exception.ValidationFailure:
+        return None
+    result = _AuthenticatedKeys(keys, min(parent_expiration, keys_expiration))
+    _cache_dns(cache, cache_key, result, result.expires_at)
+    return result
 
 
 # Errors that mean one nameserver could not answer and the next one should be
@@ -125,7 +255,7 @@ def _find_record_and_signature(
     rrset = None
     rrsig = None
     for rset in answer:
-        if rset.name != name:
+        if rset.name != name or rset.rdclass != dns.rdataclass.IN:
             continue
         if rset.rdtype == RdataType.RRSIG:
             if rset.covers == rdatatype:
@@ -254,7 +384,10 @@ def get_dnskey(
     cache: ExpiringDict | None = None,
 ) -> dict | None:
     """
-    Get a DNSKEY RRSet on the given domain
+    Get a DNSKEY RRset at the domain or its base domain
+
+    This lookup does not authenticate the keys. Use :func:`check_dnssec`
+    for a status backed by a chain of signatures to an IANA root key.
 
     Args:
         domain (str): The domain to check
@@ -273,13 +406,15 @@ def get_dnskey(
 
     domain = normalize_domain(domain)
 
-    if domain in cache:
-        cached_result = cache[domain]
-        if isinstance(cached_result, dict):
-            return cached_result
+    cache_key = _dnssec_cache_key("key", domain, nameservers)
+    cached_result = _get_cached_dns(cache, cache_key)
+    if isinstance(cached_result, dict):
+        return cached_result
 
     logger.debug(f"Checking for DNSKEY records at {domain}")
-    rrset, _, response = _query_rrset(domain, RdataType.DNSKEY, nameservers, timeout)
+    rrset, rrsig, response = _query_rrset(
+        domain, RdataType.DNSKEY, nameservers, timeout
+    )
     # A lookup that could not complete says nothing about whether the zone
     # is signed, so it is reported as "no key" without being cached — a
     # later call can still get a real answer.
@@ -306,10 +441,12 @@ def get_dnskey(
                 timeout=timeout,
                 cache=cache,
             )
-        cache[domain] = None
         return None
     key = {dns.name.from_text(domain): rrset}
-    cache[domain] = key
+    expires_at = time.time() + rrset.ttl
+    if rrsig is not None:
+        expires_at = min(expires_at, _signature_expiration(rrset, rrsig))
+    _cache_dns(cache, cache_key, key, expires_at)
     return key
 
 
@@ -323,11 +460,11 @@ def check_dnssec(
     """
     Check that DNSSEC protects the given domain's records
 
-    ``True`` means the chain from the parent zone held together when this
-    function checked it directly:
+    ``True`` means the domain has a signed record set whose keys were
+    authenticated through parent signatures to a bundled IANA root key:
 
     - The parent zone publishes a DS record for the domain's zone (the
-      domain itself, or its base domain when the domain is not a zone apex)
+      domain itself, or an ancestor when the domain is not a zone apex)
     - The zone's DNSKEY record set contains a key whose digest matches that
       DS record (RFC 4034 section 5)
     - The signature over the DNSKEY record set verifies against a DS-matched
@@ -344,13 +481,11 @@ def check_dnssec(
     warning, because mail from such a domain is rejected by receivers that
     validate), and a lookup that could not complete (not cached).
 
-    Trust assumptions: the DS record itself arrives over an unauthenticated
-    channel unless the configured resolver validates (the AD flag on its
-    answers, logged at debug level, says whether it claims to). This is a
-    one-level chain check anchored at the DS record the resolver reports,
-    not a full validator walking signatures down from the root, so a
-    resolver — or an attacker able to spoof its answers — that forges the DS
-    record along with everything below it would not be caught.
+    The resolver need not be trusted: its DS and DNSKEY answers must verify
+    through the parent chain to an IANA root key. Root anchors are updated
+    with package releases. This positive-answer check does not authenticate
+    denial of existence or wildcard expansion, and does not distinguish unsigned,
+    broken, and unavailable outcomes in its boolean result.
 
     Args:
         domain (str): The domain to check
@@ -371,10 +506,6 @@ def check_dnssec(
         cache = DNSSEC_CACHE
 
     domain = normalize_domain(domain)
-    if domain in cache:
-        cached_result = cache[domain]
-        if isinstance(cached_result, bool):
-            return cached_result
 
     # Find the zone the parent vouches for by walking from the domain
     # itself up through each ancestor to the base domain and using the
@@ -432,7 +563,6 @@ def check_dnssec(
             logger.debug(
                 f"{zone} is not signed: no DS record at its parent and no DNSKEY record"
             )
-        cache[domain] = False
         return False
 
     zone_name = dns.name.from_text(zone)
@@ -452,7 +582,6 @@ def check_dnssec(
             f"record, but the DNSKEY query failed with SERVFAIL — a "
             f"validating resolver rejected the zone as bogus"
         )
-        cache[domain] = False
         return False
     if dnskey_rrset is None or dnskey_rrsig is None:
         logger.warning(
@@ -460,12 +589,11 @@ def check_dnssec(
             f"record, but {zone} did not answer with a signed DNSKEY "
             f"record set"
         )
-        cache[domain] = False
         return False
     if key_response.flags & dns.flags.AD:
         logger.debug(
             f"The resolver set the AD flag on the {zone} DNSKEY answer: "
-            f"it validated the answer itself"
+            f"it claims to have validated the answer (not used as a trust source)"
         )
 
     matched_keys = _ds_matched_keys(zone_name, ds_rrset, dnskey_rrset)
@@ -474,7 +602,6 @@ def check_dnssec(
             f"DNSSEC for {zone} is broken: no key in its DNSKEY record set "
             f"matches a DS record at its parent"
         )
-        cache[domain] = False
         return False
     try:
         dns.dnssec.validate(dnskey_rrset, dnskey_rrsig, {zone_name: matched_keys})
@@ -483,18 +610,26 @@ def check_dnssec(
             f"DNSSEC for {zone} is broken: the signature over its DNSKEY "
             f"record set does not verify against the DS-matched key: {e}"
         )
-        cache[domain] = False
         return False
     logger.debug(
         f"The {zone} DNSKEY record set matches a DS record at its parent "
         f"and its signature verifies"
     )
 
+    authenticated_keys = _authenticate_zone_keys(zone_name, nameservers, timeout, cache)
+    if authenticated_keys is None:
+        logger.warning(
+            f"Could not authenticate DNSSEC for {domain} to an IANA root key"
+        )
+        return False
+    # Use the authenticated answer, rather than the independently retrieved
+    # local-check answer: an untrusted resolver can change responses.
+    dnskey_rrset = authenticated_keys.rrset
+
     if zone == domain:
         # The domain is the zone apex, and its DNSKEY record set — one of
         # the zone's own record sets — just validated against the parent's
         # DS record.
-        cache[domain] = True
         return True
 
     # The domain sits below the zone apex, so DNSSEC only covers it if its
@@ -521,12 +656,22 @@ def check_dnssec(
                 f"failed with SERVFAIL below the signed zone {zone} — a "
                 f"validating resolver rejected the answer as bogus"
             )
-            cache[domain] = False
             return False
         if rrset is None or rrsig is None:
             continue
+        if response is None or response.rcode() != dns.rcode.NOERROR:
+            continue
+        # RFC 4035 section 5.3.4 requires authenticated denial proofs for
+        # wildcard expansion. This positive-answer check does not verify
+        # those proofs, so a wildcard signature cannot establish True.
+        exact_signatures = dns.rrset.RRset(rrset.name, rrset.rdclass, RdataType.RRSIG)
+        for signature in rrsig:
+            if signature.labels == len(rrset.name.labels) - 1:
+                exact_signatures.add(signature)
+        if not exact_signatures:
+            continue
         try:
-            dns.dnssec.validate(rrset, rrsig, keyring)
+            dns.dnssec.validate(rrset, exact_signatures, keyring)
         except dns.exception.ValidationFailure as e:
             logger.warning(
                 f"The signature over the {rdatatype.name} record set at "
@@ -534,11 +679,9 @@ def check_dnssec(
             )
             continue
         logger.debug(f"Found a signed {rdatatype.name} record")
-        cache[domain] = True
         return True
 
     logger.debug(f"{zone} is signed, but no signed records were found at {domain}")
-    cache[domain] = False
     return False
 
 
@@ -568,7 +711,13 @@ def get_tlsa_records(
     cache: ExpiringDict | None = None,
 ) -> list[str]:
     """
-    Checks for TLSA records on the given hostname
+    Return TLSA records authenticated through DNSSEC to an IANA root key
+
+    Empty results cover absent, unavailable, or unauthenticated records.
+    Wildcard answers requiring denial proofs and CNAME/DNAME aliases are
+    not authenticated by this lookup. This function does not compare TLSA
+    associations with a server certificate; it supplies authenticated DNS
+    data for a separate certificate check (RFC 7672 section 2.1.1).
 
     Args:
         hostname (str): The hostname to check
@@ -585,17 +734,17 @@ def get_tlsa_records(
         nameservers = dns.resolver.Resolver().nameservers
     nameservers = _nameservers_to_resolver_input(nameservers)
     protocol = protocol.lower()
-    # get_dnskey keeps its own module-level cache; only hand it a cache the
-    # caller supplied, so caller-isolated caches stay isolated.
-    dnskey_cache = cache
     if cache is None:
         cache = TLSA_CACHE
 
     query_hostname = f"_{port}._{protocol}.{hostname}"
-    if query_hostname in cache:
-        cached_results = cache[query_hostname]
-        if isinstance(cached_results, list):
-            return cached_results
+    cache_key = (
+        _dnssec_cache_key("TLSA", query_hostname, nameservers),
+        tuple(str(ds) for ds in _ROOT_DS),
+    )
+    cached_results = _get_cached_dns(cache, cache_key)
+    if isinstance(cached_results, list):
+        return cached_results
     tlsa_records: list[str] = []
     if len(nameservers) == 0:
         raise ValueError("At least one nameserver is required")
@@ -614,22 +763,34 @@ def get_tlsa_records(
         return tlsa_records
     if rrset is None or rrsig is None:
         return tlsa_records
-    dnskey = get_dnskey(
-        domain=hostname,
-        nameservers=nameservers,
-        timeout=timeout,
-        cache=dnskey_cache,
+    if response.rcode() != dns.rcode.NOERROR:
+        return tlsa_records
+    tlsa_expiration = _signature_expiration(rrset, rrsig)
+    for signature in rrsig:
+        signer = signature.signer
+        # RFC 4035 section 5.3.4: a wildcard signature alone does not
+        # authenticate its expansion at this name.
+        if (
+            not rrset.name.is_subdomain(signer)
+            or signature.labels != len(rrset.name.labels) - 1
+        ):
+            continue
+        keys = _authenticate_zone_keys(signer, nameservers, timeout, cache)
+        if keys is None:
+            continue
+        try:
+            dns.dnssec.validate_rrsig(rrset, signature, {signer: keys.rrset})
+        except (
+            dns.exception.ValidationFailure,
+            dns.exception.UnsupportedAlgorithm,
+        ) as error:
+            logger.debug(f"The TLSA records at {query_hostname} do not verify: {error}")
+            continue
+        tlsa_records = [str(record) for record in rrset]
+        expires_at = min(keys.expires_at, tlsa_expiration)
+        _cache_dns(cache, cache_key, tlsa_records, expires_at)
+        return tlsa_records
+    logger.debug(
+        f"The TLSA records at {query_hostname} could not be authenticated to an IANA root key"
     )
-    if dnskey is None:
-        logger.debug(
-            f"Found TLSA records at {hostname} but not a DNSKEY record to verify them"
-        )
-        return tlsa_records
-    try:
-        dns.dnssec.validate(rrset, rrsig, dnskey)
-    except dns.exception.ValidationFailure as e:
-        logger.debug(f"The TLSA records at {query_hostname} do not verify: {e}")
-        return tlsa_records
-    tlsa_records = [str(x) for x in list(rrset.items.keys())]
-    cache[query_hostname] = tlsa_records
     return tlsa_records
