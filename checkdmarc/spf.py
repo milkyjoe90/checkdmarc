@@ -718,24 +718,9 @@ def parse_spf_record(
             f"(marked with {syntax_error_marker}) in: {marked_record}"
         )
 
-    # For grammar-level syntax checking, ignore everything after the first
-    # "all" mechanism. RFC 7208 only allows modifiers (not additional
-    # mechanisms) after mechanisms; we handle "exp=" explicitly below using
-    # AFTER_ALL_REGEX and emit warnings for any other junk.
-    #
-    # This lets us:
-    #   - keep strict syntax checking on everything up to "all"
-    #   - accept non-standard vendor junk after "all"
-    #   - still parse and preserve an exp modifier after "all"
-    grammar_record = record
-    after_all_match = AFTER_ALL_REGEX.search(record)
-    if after_all_match:
-        # AFTER_ALL_REGEX captures everything *after* the "all" token as group 1.
-        # Trim from the start of that group for the grammar input, so the
-        # grammar only sees "v=spf1 ... all" and not the trailing junk/exp.
-        grammar_record = record[: after_all_match.start(1)].rstrip()
-
-    grammar_result = spf_syntax_checker.parse(grammar_record)
+    # RFC 7208 section 4.6 requires syntax validation of the entire record,
+    # including mechanisms that cannot be reached after an all match.
+    grammar_result = spf_syntax_checker.parse(record)
 
     if not grammar_result.is_valid:
         pos = grammar_result.pos
@@ -985,77 +970,7 @@ def parse_spf_record(
                 "(RFC 6652 § 3)."
             )
 
-    # Handle the text after the first all mechanism. Evaluation stops at the
-    # first matching mechanism (RFC 7208 section 4.6.2), so terms after all
-    # are never used and are not processed, counted, or listed. Modifiers may
-    # appear anywhere in a record (RFC 7208 section 6), so each token here is
-    # looked at on its own, in the order it was written: another all
-    # mechanism only feeds the "multiple all mechanisms" warning, an exp
-    # modifier is honored, an RFC 6652 reporting modifier is set aside and
-    # recorded once the first pass has read the terms before all, and
-    # anything else is reported as ignored text.
-    deferred_rfc6652_modifiers: list[tuple[str, str]] = []
-    items_after_all: list[str] = AFTER_ALL_REGEX.findall(record)
-    if len(items_after_all) > 0:
-        extra_all_tokens: list[str] = []
-        ignored_after_all: list[str] = []
-        for token in items_after_all[0].split():
-            if ALL_TERM_REGEX.fullmatch(token) is not None:
-                extra_all_tokens.append(token)
-                continue
-            term_match = SPF_MECHANISM_REGEX.fullmatch(token)
-            if (
-                term_match is None
-                or term_match.group(3) != "="
-                or (term_match.group(1) or "") != ""
-            ):
-                # Not a modifier: a mechanism, a qualified modifier (which
-                # the RFC 7208 section 12 ABNF does not allow), or junk.
-                ignored_after_all.append(token)
-                continue
-            # Modifier names are case-insensitive (RFC 7208 section 4.6.1), so
-            # EXP= and Exp= must be recognized here too.
-            modifier_name = term_match.group(2).lower()
-            modifier_value = term_match.group(4) or ""
-            if modifier_name == "exp":
-                # RFC 7208 § 6.2 (exp modifier): The explanation string is
-                # evaluated at runtime (after result == fail) and may contain
-                # macros. It MUST NOT contribute to DNS lookup counting and
-                # SHOULD NOT be resolved during static parsing.
-                if modifier_value == "":
-                    raise SPFSyntaxError("The exp modifier is missing a value")
-                if exp_seen:
-                    # RFC 7208 § 6: an exp modifier that appears more than
-                    # once is a permerror, wherever the copies are.
-                    raise SPFSyntaxError("Multiple exp values are not permitted")
-                # The exp value keeps its original case because uppercase
-                # macro letters change how macros expand (RFC 7208 § 7.3).
-                parsed["exp"] = modifier_value
-                exp_seen = True
-                _check_exp_value(modifier_value)
-            elif modifier_name in RFC6652_MODIFIERS:
-                # Held back so that a modifier written both before and after
-                # all is recorded in the order the record lists it, and the
-                # earlier value wins.
-                deferred_rfc6652_modifiers.append((modifier_name, modifier_value))
-            else:
-                ignored_after_all.append(token)
-        if extra_all_tokens:
-            # RFC 7208 places no uniqueness constraint on all; the first
-            # match simply wins (section 4.6.2).
-            warnings.append(
-                "The record contains multiple all mechanisms; only the "
-                "first one is used (RFC 7208 § 4.6.2)."
-            )
-        if ignored_after_all:
-            warnings.append(
-                "Any text after the all mechanism other than an exp modifier "
-                "or an RFC 6652 reporting modifier is ignored."
-            )
-
-    # Split the record into terms. Everything after the first all mechanism
-    # was trimmed from grammar_record above.
-    terms = grammar_record.split()
+    terms = record.split()
     if terms and terms[0].lower() == "v=spf1":
         terms = terms[1:]
 
@@ -1063,6 +978,7 @@ def parse_spf_record(
     # ABNF. Running every syntax check before any DNS work means a record
     # with a syntax error is rejected without network traffic.
     prepared_terms: list[tuple[str, str, str | None, str, str]] = []
+    unique_modifiers: set[str] = set()
     for term in terms:
         term_match = SPF_MECHANISM_REGEX.fullmatch(term)
         if term_match is None:
@@ -1080,6 +996,15 @@ def parse_spf_record(
                     f"{domain}: Qualifiers are not allowed on modifiers "
                     f"(RFC 7208 § 12): {term}"
                 )
+            if name in ("redirect", "exp"):
+                if name in unique_modifiers:
+                    message = (
+                        "Multiple exp values are not permitted"
+                        if name == "exp"
+                        else "Multiple redirect modifiers"
+                    )
+                    raise SPFSyntaxError(message)
+                unique_modifiers.add(name)
             if name == "redirect":
                 if value == "":
                     raise SPFSyntaxError("The redirect modifier is missing a value")
@@ -1089,6 +1014,9 @@ def parse_spf_record(
             elif name == "exp":
                 if value == "":
                     raise SPFSyntaxError("The exp modifier is missing a value")
+                _validate_spf_macros(
+                    raw_value, domain, syntax_error_marker, allow_exp_only_letters=True
+                )
             elif name in RFC6652_MODIFIERS:
                 # ra=, rp=, and rr= are reporting modifiers defined by RFC 6652
                 # § 3. Their validation needs no DNS work, so they are not
@@ -1187,24 +1115,30 @@ def parse_spf_record(
                     _maybe_warn_domain_spec(name, value)
         prepared_terms.append((qualifier, name, sep, value, raw_value))
 
-    # The RFC 6652 modifiers written after all come last in the record, so
-    # they are recorded after the first pass has read the ones before it.
-    for deferred_name, deferred_value in deferred_rfc6652_modifiers:
-        _record_rfc6652_modifier(deferred_name, deferred_value)
-
     # Second pass: process the validated terms, resolving DNS where needed
     # and enforcing the RFC 7208 section 4.6.4 lookup limits after every
     # counted term.
-    for qualifier, name, _sep, value, raw_value in prepared_terms:
+    all_evaluated = False
+    for qualifier, name, sep, value, raw_value in prepared_terms:
+        if all_evaluated and sep != "=":
+            if name == "all":
+                warnings.append(
+                    "The record contains multiple all mechanisms; only the "
+                    "first one is used (RFC 7208 § 4.6.2)."
+                )
+            else:
+                warnings.append(
+                    "Mechanisms after the all mechanism are not evaluated "
+                    "(RFC 7208 § 4.6.2)."
+                )
+            continue
         mechanism_dns_lookups = 0
         mechanism_void_dns_lookups = 0
         action = spf_qualifiers[qualifier]
         mechanism = name
         try:
             if mechanism == "all":
-                # Only one all term can reach this loop: everything after
-                # the first all mechanism was trimmed from grammar_record,
-                # and extra all mechanisms are warned about there.
+                all_evaluated = True
                 parsed["all"] = action
 
             elif mechanism in ("ip4", "ip6"):

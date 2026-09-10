@@ -53,10 +53,7 @@ class Test(unittest.TestCase):
         """Ignore any mechanisms after the all mechanism, but warn about it"""
         rec = "v=spf1 ip4:213.5.39.110 -all MS=83859DAEBD1978F9A7A67D3"
         domain = "avd.dk"
-        warning = (
-            "Any text after the all mechanism other than an exp modifier or an "
-            "RFC 6652 reporting modifier is ignored."
-        )
+        warning = "The unknown modifier ms was ignored (RFC 7208 § 6)."
 
         parsed_record = checkdmarc.spf.parse_spf_record(rec, domain)
         self.assertIn(warning, parsed_record["warnings"])
@@ -696,10 +693,7 @@ class Test(unittest.TestCase):
         """Warn about text after the all mechanism (mocked; ip4 + -all needs no DNS)"""
         rec = "v=spf1 ip4:213.5.39.110 -all MS=83859DAEBD1978F9A7A67D3"
         domain = "avd.dk"
-        warning = (
-            "Any text after the all mechanism other than an exp modifier or an "
-            "RFC 6652 reporting modifier is ignored."
-        )
+        warning = "The unknown modifier ms was ignored (RFC 7208 § 6)."
 
         with patch("checkdmarc.spf.query_dns", return_value=[]):
             parsed_record = checkdmarc.spf.parse_spf_record(rec, domain)
@@ -985,19 +979,29 @@ class TestSPFExpModifier(unittest.TestCase):
             )
         )
 
-    def testTextAfterExpValueWarns(self):
-        """Junk after an exp modifier that follows all is ignored text: the
-        exp value itself is still honored."""
-        with patch("checkdmarc.spf.get_txt_records", return_value=["explanation"]):
-            result = checkdmarc.spf.parse_spf_record(
-                "v=spf1 -all exp=exp.example extra", "example.com"
-            )
-        self.assertEqual(result["parsed"]["exp"], "exp.example")
-        self.assertIn(
-            "Any text after the all mechanism other than an exp modifier or an "
-            "RFC 6652 reporting modifier is ignored.",
-            result["warnings"],
-        )
+    def testInvalidTermsAfterAllAreRejectedBeforeDNS(self):
+        """Unreachable syntax is still a permanent error (RFC 7208 §4.6)."""
+        for suffix in (
+            "garbage",
+            "ip4:999.1.2.3",
+            "a/33",
+            "+redirect=other.example",
+            "include:",
+            "exists:%{z}.example",
+            "exp=exp.example extra",
+            "redirect=one.example redirect=two.example",
+        ):
+            with (
+                self.subTest(suffix=suffix),
+                patch(
+                    "checkdmarc.spf.query_spf_record",
+                    side_effect=AssertionError("Unexpected DNS"),
+                ),
+                self.assertRaises(checkdmarc.spf.SPFSyntaxError),
+            ):
+                checkdmarc.spf.parse_spf_record(
+                    f"v=spf1 include:unqueried.example -all {suffix}", "example.com"
+                )
 
     def testTwoExpModifiersAfterAllIsSyntaxError(self):
         """RFC 7208 § 6: an exp modifier that appears more than once is a
