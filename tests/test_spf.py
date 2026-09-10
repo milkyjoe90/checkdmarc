@@ -876,12 +876,20 @@ class TestSPFPtrMechanism(unittest.TestCase):
             any("ptr mechanism should not be used" in w for w in result["warnings"])
         )
 
-    def testPtrMissingARecords(self):
-        """ptr where the target has no A records produces a missing-records warning"""
-        with patch("checkdmarc.spf.get_a_records", return_value=[]):
-            result = checkdmarc.spf.parse_spf_record("v=spf1 ptr -all", "example.com")
+    def testPtrDoesNotInventVoidLookupsFromTargetAddresses(self):
+        """A target with no own addresses can still match a sender's PTR."""
+        with patch(
+            "checkdmarc.spf.get_a_records", side_effect=AssertionError("Wrong lookup")
+        ):
+            result = checkdmarc.spf.parse_spf_record(
+                "v=spf1 ptr:one.example ptr:two.example ptr:three.example -all",
+                "example.com",
+            )
+        self.assertEqual(result["void_dns_lookups"], 0)
+        self.assertEqual(result["dns_lookups"], 3)
+        self.assertEqual(len(result["parsed"]["mechanisms"]), 3)
         self.assertTrue(
-            any("does not have any A/AAAA records" in w for w in result["warnings"])
+            all("sender IP" in w and "not assessed" in w for w in result["warnings"])
         )
 
 

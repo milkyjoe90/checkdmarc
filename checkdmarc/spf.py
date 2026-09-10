@@ -1533,33 +1533,11 @@ def parse_spf_record(
             elif mechanism == "ptr":
                 _count_dns_lookups()
                 mechanism_dns_lookups += 1
-                if "%" in value:
-                    macro_ptr_mechanism: SPFDNSLookupMechanism = {
-                        "action": action,
-                        "mechanism": mechanism,
-                        "value": value,
-                        "dns_lookups": mechanism_dns_lookups,
-                        "void_dns_lookups": mechanism_void_dns_lookups,
-                    }
-                    parsed["mechanisms"].append(macro_ptr_mechanism)
-                    raise _SPFWarning(
-                        "The ptr mechanism should not be used (RFC 7208 § 5.5)"
-                    )
+                # RFC 7208 section 5.5 starts from the SMTP sender's IP,
+                # not the target domain's own address records. A domain-only
+                # analysis cannot measure these sender-dependent voids.
                 if value == "":
                     value = domain
-                a_records = get_a_records(
-                    value,
-                    nameservers=nameservers,
-                    resolver=resolver,
-                    timeout=timeout,
-                    retries=retries,
-                )
-                if len(a_records) == 0:
-                    # Do not pre-increment void counters here; let the outer
-                    # handler for _SPFMissingRecords account for a single void lookup.
-                    raise _SPFMissingRecords(
-                        f"A ptr mechanism points to {value.lower()}, but that domain/subdomain does not have any A/AAAA records."
-                    )
                 ptr_mechanism: SPFDNSLookupMechanism = {
                     "action": action,
                     "mechanism": mechanism,
@@ -1569,7 +1547,9 @@ def parse_spf_record(
                 }
                 parsed["mechanisms"].append(ptr_mechanism)
                 raise _SPFWarning(
-                    "The ptr mechanism should not be used (RFC 7208 § 5.5)"
+                    "The ptr mechanism should not be used (RFC 7208 § 5.5); "
+                    "its reverse-DNS and void lookup checks require the sender "
+                    "IP and were not assessed."
                 )
 
         except (SPFTooManyDNSLookups, SPFTooManyVoidDNSLookups) as e:

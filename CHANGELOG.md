@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- SPF `ptr` no longer invents void failures from target-domain addresses and reports the missing sender context (RFC 7208 §5.5).
 - SPF `exists` checks count missing A answers as void lookups and identify unresolved sender-dependent macros (RFC 7208 §5.7).
 - SPF validates syntax throughout the record, including unreachable terms after `all`, before resolving mechanisms (RFC 7208 §4.6).
 - DNS and MX caches now honor answer TTLs, including alias-chain TTLs, and isolate resolver configurations (RFC 1035 §4.1.3).
