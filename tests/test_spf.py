@@ -1768,6 +1768,65 @@ class TestRFC7208Conformance(unittest.TestCase):
             )
             self.assertFalse(any("top-level label" in w for w in result["warnings"]))
 
+    def testRecursiveLookupBudgetStopsBeforeEleventhTarget(self):
+        """An attacker-controlled infinite chain is bounded before querying it."""
+        for term in ("include:", "redirect="):
+            for return_error in (False, True):
+                visited = []
+
+                def query(domain, *, visited=visited, term=term, **kwargs):
+                    visited.append(domain)
+                    return {
+                        "record": f"v=spf1 {term}n{len(visited)}.example",
+                        "warnings": [],
+                    }
+
+                with (
+                    self.subTest(term=term, return_error=return_error),
+                    patch("checkdmarc.spf.query_spf_record", side_effect=query),
+                ):
+                    if return_error:
+                        result = checkdmarc.spf.parse_spf_record(
+                            f"v=spf1 {term}n0.example",
+                            "example.com",
+                            ignore_too_many_lookups=True,
+                        )
+                        self.assertIn("11/10", str(result.get("error")))
+                        self.assertEqual(result["dns_lookups"], 11)
+                    else:
+                        with self.assertRaises(
+                            checkdmarc.spf.SPFTooManyDNSLookups
+                        ) as error:
+                            checkdmarc.spf.parse_spf_record(
+                                f"v=spf1 {term}n0.example", "example.com"
+                            )
+                        self.assertEqual(error.exception.data, {"dns_lookups": 11})
+                self.assertEqual(visited, [f"n{i}.example" for i in range(10)])
+
+    def testRecursiveBudgetsKeepPerMechanismCounts(self):
+        records = {
+            "one.example": "v=spf1 include:two.example a -all",
+            "two.example": "v=spf1 a -all",
+        }
+        with (
+            patch(
+                "checkdmarc.spf.query_spf_record",
+                side_effect=lambda domain, **kwargs: {
+                    "record": records[domain],
+                    "warnings": [],
+                },
+            ),
+            patch("checkdmarc.spf.get_a_records", return_value=["192.0.2.1"]),
+        ):
+            result = checkdmarc.spf.parse_spf_record(
+                "v=spf1 a include:one.example -all", "example.com"
+            )
+        self.assertEqual(result["dns_lookups"], 5)
+        include = cast(
+            checkdmarc.spf.SPFIncludeMechanism, result["parsed"]["mechanisms"][1]
+        )
+        self.assertEqual(include["dns_lookups"], 4)
+
     def testDuplicateIncludeCountedAgain(self):
         """A duplicate include warns but still counts the term and its
         nested lookups (RFC 7208 section 4.6.4), reusing the earlier result"""

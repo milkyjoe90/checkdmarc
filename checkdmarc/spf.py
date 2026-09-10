@@ -6,6 +6,7 @@ import ipaddress
 import logging
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import TypedDict
 
 import dns
@@ -186,6 +187,34 @@ class SPFTooManyVoidDNSLookups(SPFError):
     def __init__(self, *args, **kwargs):
         data = {"void_dns_lookups": kwargs["void_dns_lookups"]}
         SPFError.__init__(self, args[0], data=data)
+
+
+@dataclass
+class _SPFLookupBudget:
+    """One budget for every recursive branch of an SPF analysis."""
+
+    dns: int = 0
+    void: int = 0
+
+    def count(self, count: int = 1, *, void: bool = False) -> None:
+        # RFC 7208 sections 4.1 and 4.6.4: enforce one global limit at
+        # consumption time, before fetching or descending into a new term.
+        if void:
+            self.void += count
+            if self.void > 2:
+                raise SPFTooManyVoidDNSLookups(
+                    f"Parsing the SPF record has {self.void}/2 maximum void DNS "
+                    "lookups (RFC 7208 § 4.6.4)",
+                    void_dns_lookups=self.void,
+                )
+        else:
+            self.dns += count
+            if self.dns > 10:
+                raise SPFTooManyDNSLookups(
+                    f"Parsing the SPF record requires {self.dns}/10 maximum DNS "
+                    "lookups (RFC 7208 § 4.6.4)",
+                    dns_lookups=self.dns,
+                )
 
 
 class SPFRedirectLoop(SPFError):
@@ -643,6 +672,7 @@ def parse_spf_record(
     syntax_error_marker: str = SYNTAX_ERROR_MARKER,
     _include_cache: dict[str, SPFRecordResults] | None = None,
     _included: bool = False,
+    _lookup_budget: _SPFLookupBudget | None = None,
 ) -> SPFRecordResults:
     """
     Parses an SPF record, including resolving ``a``, ``mx``, and ``include`` mechanisms
@@ -678,6 +708,10 @@ def parse_spf_record(
     """
     logger.debug(f"Parsing the SPF record on {domain}")
     domain = normalize_domain(domain)
+
+    if _lookup_budget is None:
+        _lookup_budget = _SPFLookupBudget()
+    budget = _lookup_budget
 
     if seen is None:
         seen = [domain]
@@ -757,42 +791,19 @@ def parse_spf_record(
     redirect_seen = False
     ra_seen = False
 
-    def _count_dns_lookups(count: int = 1) -> None:
-        """Add DNS-querying terms to the total and enforce the 10-term limit.
-
-        RFC 7208 section 4.6.4 caps the DNS-querying terms (include, a, mx,
-        ptr, exists, and the redirect modifier) at 10 per evaluation. The cap
-        is checked every time the total grows, no matter which term kind grew
-        it, including nested include and redirect totals.
-        """
+    def _count_dns_lookups(count: int = 1, *, already_counted: bool = False) -> None:
         nonlocal total_dns_lookups
         total_dns_lookups += count
-        if total_dns_lookups > 10:
-            raise SPFTooManyDNSLookups(
-                "Parsing the SPF record requires "
-                f"{total_dns_lookups}/10 maximum DNS lookups "
-                "(RFC 7208 § 4.6.4)",
-                dns_lookups=total_dns_lookups,
-            )
+        if not already_counted:
+            budget.count(count)
 
-    def _count_void_dns_lookups(count: int = 1) -> None:
-        """Add void DNS lookups to the total and enforce the limit of 2.
-
-        RFC 7208 section 4.6.4: a term query that returns no records or
-        NXDOMAIN is a void lookup, and implementations should allow at most
-        two of them per evaluation.
-        """
+    def _count_void_dns_lookups(
+        count: int = 1, *, already_counted: bool = False
+    ) -> None:
         nonlocal total_void_dns_lookups
-        if count == 0:
-            return
         total_void_dns_lookups += count
-        if total_void_dns_lookups > 2:
-            raise SPFTooManyVoidDNSLookups(
-                "Parsing the SPF record has "
-                f"{total_void_dns_lookups}/2 maximum void DNS lookups "
-                "(RFC 7208 § 4.6.4)",
-                void_dns_lookups=total_void_dns_lookups,
-            )
+        if not already_counted:
+            budget.count(count, void=True)
 
     def _maybe_warn_domain_spec(name: str, value: str) -> None:
         """Warn when a literal domain cannot match the RFC 7208 grammar.
@@ -1338,12 +1349,17 @@ def parse_spf_record(
                         retries=retries,
                         _include_cache=_include_cache,
                         _included=_included,
+                        _lookup_budget=budget,
                     )
                     parsed["all"] = redirected_spf["parsed"]["all"]
                     mechanism_dns_lookups += redirected_spf["dns_lookups"]
                     mechanism_void_dns_lookups += redirected_spf["void_dns_lookups"]
-                    _count_dns_lookups(redirected_spf["dns_lookups"])
-                    _count_void_dns_lookups(redirected_spf["void_dns_lookups"])
+                    _count_dns_lookups(
+                        redirected_spf["dns_lookups"], already_counted=True
+                    )
+                    _count_void_dns_lookups(
+                        redirected_spf["void_dns_lookups"], already_counted=True
+                    )
                     redirect: SPFRedirect = {
                         "domain": value,
                         "record": redirect_record,
@@ -1465,10 +1481,13 @@ def parse_spf_record(
                     retries=retries,
                     _include_cache=_include_cache,
                     _included=True,
+                    _lookup_budget=budget,
                 )
                 _include_cache[value] = include
-                _count_dns_lookups(include["dns_lookups"])
-                _count_void_dns_lookups(include["void_dns_lookups"])
+                _count_dns_lookups(include["dns_lookups"], already_counted=True)
+                _count_void_dns_lookups(
+                    include["void_dns_lookups"], already_counted=True
+                )
                 mechanism_dns_lookups += include["dns_lookups"]
                 mechanism_void_dns_lookups += include["void_dns_lookups"]
                 include_mechanism: SPFIncludeMechanism = {
@@ -1528,7 +1547,13 @@ def parse_spf_record(
 
         except (SPFTooManyDNSLookups, SPFTooManyVoidDNSLookups) as e:
             if ignore_too_many_lookups:
+                # Return the diagnostic without performing further work.
+                # An exception raised deep in recursion carries the shared
+                # totals; local child totals may not have returned yet.
                 error = str(e)
+                total_dns_lookups = budget.dns
+                total_void_dns_lookups = budget.void
+                break
             else:
                 raise
 
