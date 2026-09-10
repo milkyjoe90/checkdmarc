@@ -786,6 +786,30 @@ class TestExtractLogoFromCertificate(unittest.TestCase):
         result = checkdmarc.bimi.extract_logo_from_certificate(cert)
         self.assertEqual(result, svg_bytes)
 
+    def testCompressedLogoIsExtractedWithinLimit(self):
+        import gzip
+
+        svg = VALID_SVG.encode()
+        pem = _build_cert(extensions=[(_logotype_extension(gzip.compress(svg)), False)])
+        self.assertEqual(checkdmarc.bimi.extract_logo_from_certificate(pem), svg)
+
+    def testTruncatedCompressedLogoRaisesValueError(self):
+        pem = _build_cert(extensions=[(_logotype_extension(b"\x1f\x8b"), False)])
+        with self.assertRaisesRegex(ValueError, "Invalid gzip-compressed BIMI logo"):
+            checkdmarc.bimi.extract_logo_from_certificate(pem)
+
+    def testLogoExpansionIsBounded(self):
+        import gzip
+
+        logo = b"X" * (checkdmarc.bimi.MAX_BIMI_LOGO_BYTES + 1)
+        for encoded in (logo, gzip.compress(logo)):
+            pem = _build_cert(extensions=[(_logotype_extension(encoded), False)])
+            with (
+                self.subTest(compressed=len(encoded) < len(logo)),
+                self.assertRaisesRegex(ValueError, "Certificate logo exceeds"),
+            ):
+                checkdmarc.bimi.extract_logo_from_certificate(pem)
+
 
 class TestCheckBimi(unittest.TestCase):
     def testRecordNotFoundError(self):
@@ -1637,7 +1661,7 @@ class TestGetCertificateMetadata(unittest.TestCase):
         )
 
     def testValidLogotypeExtracted(self):
-        """A cert with a logotype extension exposes a logotype_sha256"""
+        """A valid cert with a logotype extension exposes a logotype_sha256"""
         import hashlib
 
         name_attrs, custom_attrs = _full_subject_attrs()
@@ -1648,8 +1672,53 @@ class TestGetCertificateMetadata(unittest.TestCase):
             san_dns=["example.com"],
             extensions=[(_logotype_extension(svg), False)],
         )
-        result = checkdmarc.bimi.get_certificate_metadata(pem, domain="example.com")
+        with _trust_certificate(pem):
+            result = checkdmarc.bimi.get_certificate_metadata(pem, domain="example.com")
         self.assertEqual(result["logotype_sha256"], hashlib.sha256(svg).hexdigest())
+
+    def testInvalidCertificateDoesNotExpandMalformedLogo(self):
+        name_attrs, custom_attrs = _full_subject_attrs()
+        pem = _build_cert(
+            subject_attrs=name_attrs,
+            custom_oid_subject_attrs=custom_attrs,
+            san_dns=["example.com"],
+            extensions=[(_logotype_extension(b"\x1f\x8b"), False)],
+        )
+        result = checkdmarc.bimi.get_certificate_metadata(pem)
+        self.assertFalse(result["valid"])
+        self.assertIsNone(result["logotype_sha256"])
+        self.assertEqual(
+            result["validation_errors"],
+            [
+                "The certificate was not issued by a recognized Mark Verifying Authority (MVA)."
+            ],
+        )
+
+    def testMalformedTrustedLogoIsReportedWithoutAbortingBIMI(self):
+        name_attrs, custom_attrs = _full_subject_attrs()
+        pem = _build_cert(
+            subject_attrs=name_attrs,
+            custom_oid_subject_attrs=custom_attrs,
+            san_dns=["example.com"],
+            extensions=[(_logotype_extension(b"\x1f\x8b"), False)],
+        )
+        with (
+            _trust_certificate(pem),
+            patch(
+                "checkdmarc.bimi.requests.Session.get", return_value=_fake_response(pem)
+            ),
+        ):
+            result = checkdmarc.bimi.parse_bimi_record(
+                "v=BIMI1; l=; a=https://example.com/mark.pem", domain="example.com"
+            )
+        self.assertFalse(result["certificate"]["valid"])
+        self.assertIsNone(result["certificate"]["logotype_sha256"])
+        self.assertTrue(
+            any(
+                "Invalid gzip-compressed BIMI logo" in error
+                for error in result["certificate"]["validation_errors"]
+            )
+        )
 
     def testPriorUseMarkWithoutSourceURL(self):
         """A recent Prior Use Mark must carry a priorUseMarkSourceURL

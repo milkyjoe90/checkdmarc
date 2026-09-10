@@ -5,9 +5,11 @@ from __future__ import annotations
 import base64
 import gzip
 import hashlib
+import io
 import ipaddress
 import logging
 import re
+import zlib
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any, TypedDict
@@ -74,6 +76,7 @@ See the License for the specific language governing permissions and
 limitations under the License."""
 
 logger = logging.getLogger(__name__)
+MAX_BIMI_LOGO_BYTES = 1024 * 1024
 
 
 # TypedDict definitions for BIMI record structures
@@ -654,11 +657,22 @@ def extract_logo_from_certificate(
 
         compressed = base64.b64decode(b64_clean, validate=False)
 
-        # If it’s gzipped SVG (common), decompress. Otherwise return raw.
-        try:
-            return gzip.decompress(compressed)
-        except OSError:
-            return compressed
+        # BIMI draft section 7.6 permits receiver size limits. Bound the
+        # expanded bytes before hashing; a small certificate can otherwise
+        # contain a gzip stream that exhausts the worker's memory.
+        if compressed.startswith(b"\x1f\x8b"):
+            try:
+                with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as logo_file:
+                    logo = logo_file.read(MAX_BIMI_LOGO_BYTES + 1)
+            except (OSError, EOFError, zlib.error) as error:
+                raise ValueError(
+                    f"Invalid gzip-compressed BIMI logo: {error}"
+                ) from error
+        else:
+            logo = compressed
+        if len(logo) > MAX_BIMI_LOGO_BYTES:
+            raise ValueError(f"Certificate logo exceeds {MAX_BIMI_LOGO_BYTES} bytes")
+        return logo
 
     except ExtensionNotFound:
         return None
@@ -856,7 +870,9 @@ def get_certificate_metadata(pem_crt: bytes, *, domain=None) -> dict[str, Any]:
         metadata["valid"] = not validation_errors
         metadata["domains"] = cert_domains
         metadata["logotype_sha256"] = None
-        logotype = extract_logo_from_certificate(vmc)
+        # Do not spend work expanding an untrusted or otherwise invalid
+        # certificate's logo. Its validation errors already explain failure.
+        logotype = extract_logo_from_certificate(vmc) if metadata["valid"] else None
         if logotype is not None:
             metadata["logotype_sha256"] = hashlib.sha256(logotype).hexdigest()
         metadata["warnings"] = warnings
