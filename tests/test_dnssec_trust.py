@@ -290,3 +290,67 @@ class TestDNSSECTrust(unittest.TestCase):
         # Failures are remembered only for this call, not the caller's cache.
         self.dns.records[root_key] = original_root
         self.assertEqual(self.tlsa(), [self.dns.tlsa])
+
+    def test_parent_signature_expiring_during_host_query_cannot_return_true(self):
+        now = int(time.time())
+        with patch("time.time", return_value=now) as clock:
+            keys, _ = self.dns.records[("com.", dns.rdatatype.DNSKEY)]
+            self.dns.publish(keys, "com.", lifetime=1)
+
+            def delayed_query(request, nameserver, timeout):
+                if request.question[0].rdtype == dns.rdatatype.A:
+                    clock.return_value = now + 2
+                return self.dns.query(request, nameserver, timeout)
+
+            with patch.object(dnssec, "_query_nameserver", side_effect=delayed_query):
+                self.assertIs(self.check("mail.example.com"), False)
+
+    def test_parent_signature_expiring_during_child_validation_cannot_authenticate(
+        self,
+    ):
+        now = int(time.time())
+        validate = dns.dnssec.validate_rrsig
+        with patch("time.time", return_value=now) as clock:
+            ds, _ = self.dns.records[("com.", dns.rdatatype.DS)]
+            self.dns.publish(ds, ".", lifetime=1)
+
+            def delayed_validate(rrset, signature, keys, **kwargs):
+                if rrset.name.to_text() == "example.com.":
+                    clock.return_value = now + 2
+                return validate(rrset, signature, keys, **kwargs)
+
+            with patch("dns.dnssec.validate_rrsig", side_effect=delayed_validate):
+                self.assertEqual(self.tlsa(), [])
+
+    def test_signature_expiring_during_tlsa_validation_is_not_reported(self):
+        now = int(time.time())
+        validate = dns.dnssec.validate_rrsig
+        with patch("time.time", return_value=now) as clock:
+            tlsa, _ = self.dns.records[
+                ("_25._tcp.mail.example.com.", dns.rdatatype.TLSA)
+            ]
+            self.dns.publish(tlsa, "example.com.", lifetime=1)
+
+            def delayed_validate(rrset, signature, keys, **kwargs):
+                result = validate(rrset, signature, keys, **kwargs)
+                if rrset.rdtype == dns.rdatatype.TLSA:
+                    clock.return_value = now + 2
+                return result
+
+            with patch("dns.dnssec.validate_rrsig", side_effect=delayed_validate):
+                self.assertEqual(self.tlsa(), [])
+
+    def test_zero_ttl_can_authenticate_current_transaction_without_reuse(self):
+        for rrset, signatures in self.dns.records.values():
+            rrset.ttl = signatures.ttl = 0
+        self.assertIs(self.check("mail.example.com"), True)
+        self.assertEqual(self.tlsa(), [self.dns.tlsa])
+        self.dns.records.pop((".", dns.rdatatype.DNSKEY))
+        self.assertEqual(self.tlsa(), [])
+
+    def test_expired_additional_signature_does_not_invalidate_current_signature(self):
+        _, signatures = self.dns.records[("com.", dns.rdatatype.DNSKEY)]
+        signature = next(iter(signatures))
+        signatures.add(signature.replace(expiration=int(time.time()) - 1))
+        self.assertIs(self.check("mail.example.com"), True)
+        self.assertEqual(self.tlsa(), [self.dns.tlsa])

@@ -210,7 +210,7 @@ class Test(unittest.TestCase):
         line up (mocked network, real cryptography)"""
         ds, key, sig = _signed_zone("example.com.")
         authenticate.return_value = checkdmarc.dnssec._AuthenticatedKeys(
-            key, time.time() + 300
+            key, time.time() + 300, time.time() + 300
         )
         with patch(
             "dns.query.tcp",
@@ -402,7 +402,7 @@ class TestCheckDnssec(unittest.TestCase):
         cache = _fresh_cache()
         ds, key, sig = _signed_zone("example.com.")
         authenticate.return_value = checkdmarc.dnssec._AuthenticatedKeys(
-            key, time.time() + 300
+            key, time.time() + 300, time.time() + 300
         )
         with patch("dns.query.tcp", side_effect=[_response(ds), _response(key, sig)]):
             result = checkdmarc.dnssec.check_dnssec(
@@ -572,7 +572,7 @@ class TestCheckDnssec(unittest.TestCase):
             _rrsig("sub.example.com.", "MX"),
         )
         authenticate.return_value = checkdmarc.dnssec._AuthenticatedKeys(
-            key, time.time() + 300
+            key, time.time() + 300, time.time() + 300
         )
         with (
             patch(
@@ -588,6 +588,7 @@ class TestCheckDnssec(unittest.TestCase):
             # patched out; the DS-to-DNSKEY digest comparison still runs for
             # real. testValidChainReturnsTrue covers real verification.
             patch("dns.dnssec.validate", return_value=None),
+            patch("dns.dnssec.validate_rrsig", return_value=None),
         ):
             result = checkdmarc.dnssec.check_dnssec(
                 "sub.example.com", nameservers=["192.0.2.1"], cache=_fresh_cache()
@@ -605,7 +606,7 @@ class TestCheckDnssec(unittest.TestCase):
             _rrsig("sub.example.com.", "AAAA"),
         )
         authenticate.return_value = checkdmarc.dnssec._AuthenticatedKeys(
-            key, time.time() + 300
+            key, time.time() + 300, time.time() + 300
         )
         with (
             patch(
@@ -623,6 +624,7 @@ class TestCheckDnssec(unittest.TestCase):
             # patched out; the DS-to-DNSKEY digest comparison still runs
             # for real.
             patch("dns.dnssec.validate", return_value=None),
+            patch("dns.dnssec.validate_rrsig", return_value=None),
         ):
             result = checkdmarc.dnssec.check_dnssec(
                 "sub.example.com", nameservers=["192.0.2.1"], cache=_fresh_cache()
@@ -637,7 +639,7 @@ class TestCheckDnssec(unittest.TestCase):
             dns.rrset.from_text("sub.example.com.", 300, "IN", "A", "192.0.2.1")
         )
         authenticate.return_value = checkdmarc.dnssec._AuthenticatedKeys(
-            key, time.time() + 300
+            key, time.time() + 300, time.time() + 300
         )
         with (
             patch(
@@ -676,7 +678,7 @@ class TestCheckDnssec(unittest.TestCase):
             _rrsig("sub.example.com.", "MX"),
         )
         authenticate.return_value = checkdmarc.dnssec._AuthenticatedKeys(
-            key, time.time() + 300
+            key, time.time() + 300, time.time() + 300
         )
         with (
             patch(
@@ -707,7 +709,7 @@ class TestCheckDnssec(unittest.TestCase):
         a broken zone rather than treated as an unsigned record"""
         ds, key, sig = _signed_zone("example.com.")
         authenticate.return_value = checkdmarc.dnssec._AuthenticatedKeys(
-            key, time.time() + 300
+            key, time.time() + 300, time.time() + 300
         )
         with (
             patch(
@@ -773,7 +775,7 @@ class TestCheckDnssec(unittest.TestCase):
         key_response = _response(key, sig)
         key_response.flags = dns.flags.AD
         authenticate.return_value = checkdmarc.dnssec._AuthenticatedKeys(
-            key, time.time() + 300
+            key, time.time() + 300, time.time() + 300
         )
         with (
             patch("dns.query.tcp", side_effect=[_response(ds), key_response]),
@@ -822,7 +824,7 @@ class TestCheckDnssec(unittest.TestCase):
             dns.dnssec.sign(a_rrset, private_key, zone, dnskey, lifetime=3600),
         )
         authenticate.return_value = checkdmarc.dnssec._AuthenticatedKeys(
-            key_rrset, time.time() + 300
+            key_rrset, time.time() + 300, time.time() + 300
         )
         with patch(
             "dns.query.tcp",
@@ -873,6 +875,7 @@ class TestGetTlsaRecords(unittest.TestCase):
                         "example.com.", 300, "IN", "DNSKEY", DNSKEY_RDATA
                     ),
                     time.time() + 300,
+                    time.time() + 300,
                 ),
             ),
             patch("dns.dnssec.validate_rrsig", return_value=None),
@@ -903,6 +906,7 @@ class TestGetTlsaRecords(unittest.TestCase):
                     dns.rrset.from_text(
                         "example.com.", 300, "IN", "DNSKEY", DNSKEY_RDATA
                     ),
+                    time.time() + 300,
                     time.time() + 300,
                 ),
             ),
@@ -947,6 +951,7 @@ class TestGetTlsaRecords(unittest.TestCase):
                     dns.rrset.from_text(
                         "example.com.", 300, "IN", "DNSKEY", DNSKEY_RDATA
                     ),
+                    time.time() + 300,
                     time.time() + 300,
                 ),
             ),
@@ -1047,6 +1052,7 @@ class TestGetTlsaRecords(unittest.TestCase):
                     dns.rrset.from_text(
                         "example.com.", 300, "IN", "DNSKEY", DNSKEY_RDATA
                     ),
+                    time.time() + 300,
                     time.time() + 300,
                 ),
             ),

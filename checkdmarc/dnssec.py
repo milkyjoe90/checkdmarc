@@ -85,6 +85,7 @@ _ROOT_DS = dns.rrset.from_text(
 class _AuthenticatedKeys:
     rrset: dns.rrset.RRset
     expires_at: float
+    signature_expires_at: float
 
 
 def _dnssec_cache_key(
@@ -124,7 +125,10 @@ def _authenticate_zone_keys(
     if _attempts is None:
         _attempts = {}
     if zone in _attempts:
-        return _attempts[zone]
+        previous = _attempts[zone]
+        if previous is not None and previous.signature_expires_at < time.time():
+            return None
+        return previous
     _attempts[zone] = None
     cache_key = (
         _dnssec_cache_key("authenticated-key", zone.to_text(), nameservers),
@@ -143,6 +147,7 @@ def _authenticate_zone_keys(
         return None
     keys_expiration = _signature_expiration(keys, key_signature)
     parent_expiration = float("inf")
+    parent_signature_expiration = float("inf")
     if zone == dns.name.root:
         ds_records = _ROOT_DS
     else:
@@ -181,6 +186,9 @@ def _authenticate_zone_keys(
             ):
                 continue
             parent_expiration = min(parent_keys.expires_at, ds_expiration)
+            parent_signature_expiration = min(
+                parent_keys.signature_expires_at, signature.expiration
+            )
             authenticated_parent = True
             break
         if not authenticated_parent:
@@ -190,20 +198,26 @@ def _authenticate_zone_keys(
         return None
     # A zone's DNSKEY RRset must be signed by a matching zone key, rather
     # than by a same-tag key belonging to a different name.
-    valid_signatures = dns.rrset.RRset(zone, dns.rdataclass.IN, RdataType.RRSIG)
     for signature in key_signature:
-        if signature.signer == zone and signature.labels == len(zone.labels) - 1:
-            valid_signatures.add(signature)
-    if not valid_signatures:
-        return None
-    try:
-        dns.dnssec.validate(keys, valid_signatures, {zone: trusted_keys})
-    except dns.exception.ValidationFailure:
-        return None
-    result = _AuthenticatedKeys(keys, min(parent_expiration, keys_expiration))
-    _cache_dns(cache, cache_key, result, result.expires_at)
-    _attempts[zone] = result
-    return result
+        if signature.signer != zone or signature.labels != len(zone.labels) - 1:
+            continue
+        try:
+            dns.dnssec.validate_rrsig(keys, signature, {zone: trusted_keys})
+        except (dns.exception.ValidationFailure, dns.exception.UnsupportedAlgorithm):
+            continue
+        signature_expiration = min(parent_signature_expiration, signature.expiration)
+        # RFC 4035 sections 5.3.1 and 5.3.3: every signature in the trust
+        # chain must still be valid when it is used. Keep this separate from
+        # cache expiry: RFC 1035 section 4.1.3 permits TTL=0 for this lookup.
+        if signature_expiration < time.time():
+            continue
+        result = _AuthenticatedKeys(
+            keys, min(parent_expiration, keys_expiration), signature_expiration
+        )
+        _cache_dns(cache, cache_key, result, result.expires_at)
+        _attempts[zone] = result
+        return result
+    return None
 
 
 # Errors that mean one nameserver could not answer and the next one should be
@@ -641,6 +655,12 @@ def check_dnssec(
     # local-check answer: an untrusted resolver can change responses.
     dnskey_rrset = authenticated_keys.rrset
 
+    if authenticated_keys.signature_expires_at < time.time():
+        logger.warning(
+            f"The DNSSEC authentication chain for {domain} expired during the lookup"
+        )
+        return False
+
     if zone == domain:
         # The domain is the zone apex, and its DNSKEY record set — one of
         # the zone's own record sets — just validated against the parent's
@@ -685,16 +705,28 @@ def check_dnssec(
                 exact_signatures.add(signature)
         if not exact_signatures:
             continue
-        try:
-            dns.dnssec.validate(rrset, exact_signatures, keyring)
-        except dns.exception.ValidationFailure as e:
-            logger.warning(
-                f"The signature over the {rdatatype.name} record set at "
-                f"{domain} does not verify against the {zone} keys: {e}"
-            )
-            continue
-        logger.debug(f"Found a signed {rdatatype.name} record")
-        return True
+        for signature in exact_signatures:
+            try:
+                dns.dnssec.validate_rrsig(rrset, signature, keyring)
+            except (
+                dns.exception.ValidationFailure,
+                dns.exception.UnsupportedAlgorithm,
+            ) as e:
+                logger.warning(
+                    f"The signature over the {rdatatype.name} record set at "
+                    f"{domain} does not verify against the {zone} keys: {e}"
+                )
+                continue
+            if (
+                min(authenticated_keys.signature_expires_at, signature.expiration)
+                < time.time()
+            ):
+                logger.warning(
+                    f"The DNSSEC authentication chain for {domain} expired during the lookup"
+                )
+                return False
+            logger.debug(f"Found a signed {rdatatype.name} record")
+            return True
 
     logger.debug(f"{zone} is signed, but no signed records were found at {domain}")
     return False
@@ -803,6 +835,8 @@ def get_tlsa_records(
             dns.exception.UnsupportedAlgorithm,
         ) as error:
             logger.debug(f"The TLSA records at {query_hostname} do not verify: {error}")
+            continue
+        if min(keys.signature_expires_at, signature.expiration) < time.time():
             continue
         tlsa_records = [str(record) for record in rrset]
         expires_at = min(keys.expires_at, tlsa_expiration)

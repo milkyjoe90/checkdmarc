@@ -4,6 +4,7 @@
 
 ### Security
 
+- DNSSEC rejects chains whose verified signatures expire during a lookup while retaining valid zero-TTL answers for that transaction (RFC 4035 §5.3.1).
 - DNSSEC reuses parent authentication attempts within one check so repeated signatures cannot multiply failed chain walks.
 - BIMI bounds embedded-logo expansion, skips extraction from invalid certificates, and reports malformed gzip without aborting the check.
 - DNSSEC and TLSA signatures now require a chain to bundled IANA root keys, with resolver-scoped TTL and signature-expiry caches (RFC 4035 §5).
