@@ -13,7 +13,6 @@ import zlib
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any, TypedDict
-from xml.parsers.expat import ExpatError
 
 try:
     from importlib.resources import files
@@ -26,7 +25,6 @@ import dns.exception
 import dns.resolver
 import pyleri
 import requests
-import xmltodict
 from cryptography import x509
 from cryptography.x509 import (
     ExtensionNotFound,
@@ -53,6 +51,7 @@ from checkdmarc._constants import (
     USER_AGENT,
 )
 from checkdmarc._http import MAX_HTTP_REDIRECTS, PublicHTTPSAdapter, validate_https_url
+from checkdmarc._svg import get_svg_metadata as _get_svg_metadata
 from checkdmarc.dmarc import DMARCErrorResults, DMARCResults
 from checkdmarc.utils import (
     WSP_REGEX,
@@ -92,8 +91,8 @@ class SVGMetadata(TypedDict):
     title: str
     description: str
     overflow: str
-    width: float
-    height: float
+    width: float | None
+    height: float | None
     filesize: str
     sha256: str
 
@@ -546,55 +545,17 @@ class _BIMIGrammar(pyleri.Grammar):
 
 
 def get_svg_metadata(raw_xml: str | bytes) -> dict[str, Any]:
-    metadata = {}
-    # Keep the original bytes for the size and hash below, and hand those
-    # same bytes to the XML parser. Decoding with errors="ignore" would
-    # drop malformed bytes, so a sanitized version of the document could
-    # validate as XML while the hash describes the unsanitized file; the
-    # parser also reads the XML declaration itself, so non-UTF-8 encodings
-    # are handled instead of being garbled by a forced UTF-8 decode.
-    if isinstance(raw_xml, bytes):
-        raw_bytes = raw_xml
-    else:
-        raw_bytes = raw_xml.encode("utf-8")
-    try:
-        xml = xmltodict.parse(raw_bytes)
-        svg = xml["svg"]
-        metadata["svg_version"] = svg["@version"]
-        if "@baseProfile" in svg:
-            metadata["base_profile"] = svg["@baseProfile"]
-        view_box = svg["@viewBox"]
-        view_box = view_box.split(" ")
-        width = float(view_box[-2])
-        height = float(view_box[-1])
-        if "@x" in svg:
-            metadata["x"] = svg["@x"]
-        if "@y" in svg:
-            metadata["y"] = svg["@y"]
-        if "title" in svg:
-            metadata["title"] = svg["title"]
-        description = None
-        if "description" in svg:
-            description = svg["description"]
-        if "overflow" in svg:
-            metadata["overflow"] = svg["overflow"]
-        if description is not None:
-            metadata["description"] = description
-        metadata["width"] = width
-        metadata["height"] = height
-        # The size that counts against the 32 KB cap is the size of the
-        # file as served, i.e. the length of the raw bytes.
-        metadata["filesize"] = f"{len(raw_bytes) / 1000} KB"
-        # Hash the raw bytes so the value can be compared against the
-        # certificate's embedded logotype hash byte for byte.
-        metadata["sha256"] = hashlib.sha256(raw_bytes).hexdigest()
-        return metadata
-    except (ExpatError, KeyError, ValueError, IndexError, TypeError) as e:
-        raise ValueError(f"Not an SVG file: {e!s}")
+    """Extract SVG metadata and check the bundled SVG Tiny PS schema.
+
+    Parsing is limited to 1 MiB and never loads referenced resources. Dimensions
+    are null when they cannot be determined without rendering. This checks
+    structure and selected profile rules, not appearance or every geometry value.
+    """
+    return _get_svg_metadata(raw_xml)
 
 
 def check_svg_requirements(svg_metadata: dict) -> list[str]:
-    _errors = []
+    _errors = list(svg_metadata.get("validation_errors", []))
     if svg_metadata["svg_version"] != "1.2":
         _errors.append(
             f"The SVG version must be 1.2, not {svg_metadata['svg_version']}"
@@ -615,8 +576,6 @@ def check_svg_requirements(svg_metadata: dict) -> list[str]:
     for attribute in invalid_attributes:
         if attribute in svg_metadata:
             _errors.append(f"The SVG cannot include {attribute} in the svg element")
-    if float(svg_metadata["filesize"].strip(" KB")) > 32:
-        _errors.append("The SVG file exceeds the maximum size of 32 KB")
     return _errors
 
 
@@ -1295,7 +1254,12 @@ def parse_bimi_record(
         if raw_xml is not None:
             try:
                 svg_metadata = get_svg_metadata(raw_xml)
-                if svg_metadata["width"] != svg_metadata["height"]:
+                warnings.extend(svg_metadata.get("warnings", []))
+                if (
+                    svg_metadata["width"] is not None
+                    and svg_metadata["height"] is not None
+                    and svg_metadata["width"] != svg_metadata["height"]
+                ):
                     warnings.append(
                         f"It is recommended that the BIMI SVG image be square (equal width and height), not {svg_metadata['width']}x{svg_metadata['height']}."
                     )

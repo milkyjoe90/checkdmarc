@@ -339,11 +339,12 @@ class TestCheckSvgRequirements(unittest.TestCase):
         )
         self.assertEqual(sum("cannot include" in e for e in errors), 2)
 
-    def testTooLarge(self):
-        errors = checkdmarc.bimi.check_svg_requirements(
-            self._base_metadata(filesize="64.0 KB")
+    def testRecommendedSizeIsWarning(self):
+        metadata = checkdmarc.bimi.get_svg_metadata(VALID_SVG + " " * 32000)
+        self.assertEqual(checkdmarc.bimi.check_svg_requirements(metadata), [])
+        self.assertTrue(
+            any("recommended size of 32 KB" in w for w in metadata["warnings"])
         )
-        self.assertTrue(any("32 KB" in e for e in errors))
 
 
 class TestQueryBimiRecordSuccess(unittest.TestCase):

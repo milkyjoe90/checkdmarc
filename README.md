@@ -40,6 +40,18 @@ Please consider [sponsoring my work](https://github.com/sponsors/seanthegeek) if
 - SOA record parsing
 - Nameserver listing
 
+## BIMI images
+
+SVG checks use a bundled copy of the BIMI Group's SVG Tiny PS schema. Parsing
+and downloads are limited to 1 MiB, and external image references are rejected.
+The profile's recommended 32 KB size is a warning. Width and height can be
+`null` when they cannot be determined without rendering.
+
+These checks validate structure and selected profile rules; they do not render
+the logo or validate every geometry value. A passing result does not make an
+untrusted SVG safe to inline in a web page. See the bundled
+[schema provenance and limitations](https://github.com/domainaware/checkdmarc/blob/main/checkdmarc/resources/SVG_PS.md).
+
 ## DNSSEC results
 
 `dnssec: true` means at least one checked record set was authenticated through
