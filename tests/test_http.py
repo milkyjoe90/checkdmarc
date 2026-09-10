@@ -4,10 +4,22 @@ import gzip
 import io
 import socket
 import ssl
+import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 import requests
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    NoEncryption,
+    PrivateFormat,
+)
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from checkdmarc._http import MAX_HTTP_REDIRECTS, PublicHTTPSAdapter
 from checkdmarc.bimi import parse_bimi_record
@@ -58,6 +70,91 @@ class _TLSContext:
     def wrap_socket(self, sock, *, server_hostname):
         sock.hostname = server_hostname
         return sock
+
+
+def _https_test_server(directory):
+    """Create a CA and server certificate that pass OpenSSL's strict checks."""
+    now = datetime.now(timezone.utc)
+    ca_key = ec.generate_private_key(ec.SECP256R1())
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "HTTPS test CA")])
+    certificates = []
+    server_key = None
+    for is_ca in (True, False):
+        key = ca_key if is_ca else ec.generate_private_key(ec.SECP256R1())
+        subject = (
+            ca_name
+            if is_ca
+            else x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "logo.example")])
+        )
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(ca_name)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(days=1))
+            .not_valid_after(now + timedelta(days=1))
+            .add_extension(x509.BasicConstraints(ca=is_ca, path_length=None), True)
+            .add_extension(
+                x509.KeyUsage(
+                    True, False, False, False, False, is_ca, is_ca, False, False
+                ),
+                True,
+            )
+            .add_extension(
+                x509.SubjectKeyIdentifier.from_public_key(key.public_key()), False
+            )
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
+                False,
+            )
+        )
+        if not is_ca:
+            builder = builder.add_extension(
+                x509.SubjectAlternativeName([x509.DNSName("logo.example")]), False
+            ).add_extension(
+                x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), False
+            )
+            server_key = key
+        certificates.append(builder.sign(ca_key, hashes.SHA256()))
+    ca_file, cert_file, key_file = (
+        Path(directory) / name for name in ("ca.pem", "cert.pem", "key.pem")
+    )
+    ca_file.write_bytes(certificates[0].public_bytes(Encoding.PEM))
+    cert_file.write_bytes(certificates[1].public_bytes(Encoding.PEM))
+    assert server_key is not None
+    key_file.write_bytes(
+        server_key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
+    )
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert_file, key_file)
+    return context, str(ca_file)
+
+
+def _verify_in_memory(client_context, server_context, hostname):
+    """Replace network transport with memory, retaining real TLS verification."""
+    client_in, client_out, server_in, server_out = (ssl.MemoryBIO() for _ in range(4))
+    client = client_context.wrap_bio(client_in, client_out, server_hostname=hostname)
+    server = server_context.wrap_bio(server_in, server_out, server_side=True)
+    client_done = server_done = False
+    for _ in range(20):
+        if not client_done:
+            try:
+                client.do_handshake()
+                client_done = True
+            except ssl.SSLWantReadError:
+                pass
+        server_in.write(client_out.read())
+        if not server_done:
+            try:
+                server.do_handshake()
+                server_done = True
+            except ssl.SSLWantReadError:
+                pass
+        client_in.write(server_out.read())
+        if client_done and server_done:
+            return
+    raise TimeoutError("In-memory HTTPS handshake did not finish")
 
 
 class TestPublicHTTPS(unittest.TestCase):
@@ -129,6 +226,53 @@ class TestPublicHTTPS(unittest.TestCase):
         self.assertIn(b"Host: logo.example:8443\r\n", sock.sent)
         self.assertIn(b"GET /a.svg?x=1 HTTP/1.1\r\n", sock.sent)
         self.assertTrue(sock.closed)
+
+    def testDNSRootDotPreservesResolutionAndVerifiesRealTLSIdentity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            server_context, ca_file = _https_test_server(directory)
+            received_names = []
+
+            def receive_name(tls_socket, name, context):
+                received_names.append(name)
+
+            server_context.sni_callback = receive_name
+
+            def wrap_socket(context, sock, *, server_hostname):
+                _verify_in_memory(context, server_context, server_hostname)
+                return sock
+
+            for hostname in ("logo.example", "logo.example.", "wrong.example."):
+                sock = _Socket(_wire_response())
+
+                def lookup(name, port, *, expected_hostname=hostname, **kwargs):
+                    # Removing the root dot before resolution would change the
+                    # answer (for example, when DNS search domains are in use).
+                    address = "8.8.8.8" if name == expected_hostname else "127.0.0.1"
+                    return [
+                        (socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port))
+                    ]
+
+                with (
+                    self.subTest(hostname=hostname),
+                    patch("checkdmarc._http.DEFAULT_CA_BUNDLE_PATH", ca_file),
+                    patch("checkdmarc._http.socket.getaddrinfo", side_effect=lookup),
+                    patch("checkdmarc._http.socket.socket", return_value=sock),
+                    patch.object(ssl.SSLContext, "wrap_socket", wrap_socket),
+                ):
+                    url = f"https://{hostname}/logo.svg"
+                    if hostname == "wrong.example.":
+                        with self.assertRaises(requests.RequestException) as caught:
+                            self.session.get(url, timeout=1)
+                        self.assertIsInstance(
+                            caught.exception.__cause__, ssl.SSLCertVerificationError
+                        )
+                    else:
+                        result = self.session.get(url, timeout=1)
+                        self.assertEqual(result.content, b"ok")
+                        self.assertEqual(sock.destination, ("8.8.8.8", 443))
+                        self.assertIn(f"Host: {hostname}\r\n".encode(), sock.sent)
+                        self.assertEqual(received_names[-1], "logo.example")
+                    self.assertTrue(sock.closed)
 
     def testRedirectCannotDowngradeOrUsePrivateAddresses(self):
         for destination in (

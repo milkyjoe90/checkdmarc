@@ -102,7 +102,10 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         timeout: float,
     ):
         self._addresses = addresses
-        self._tls_hostname = hostname
+        # RFC 3986 section 3.2.2 permits a DNS root dot in URLs, but RFC
+        # 6066 section 3 excludes it from TLS SNI. Keep the original host
+        # for DNS resolution and the HTTP Host header.
+        self._tls_hostname = hostname.removesuffix(".")
         self._connect_timeout = timeout
         self._tls_context = ssl.create_default_context(cafile=DEFAULT_CA_BUNDLE_PATH)
         self._tls_context.hostname_checks_common_name = False

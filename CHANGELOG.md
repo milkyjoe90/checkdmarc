@@ -13,6 +13,7 @@
 
 ### Fixed
 
+- BIMI HTTPS downloads accept a final DNS root dot while verifying the undotted TLS identity and preserving the DNS query name (RFC 6066 §3).
 - BIMI SVGs are checked against the published Tiny PS schema with bounded XML parsing and local references, while optional viewBox and recommended size limits follow the profile (SVG Tiny PS draft §7).
 - MX reverse-DNS confirmation uses the selected nameservers consistently.
 - Optional SMTP checks now compare peer certificates with authenticated TLSA data and report matches, mismatches, or unassessed results with explicit limits (RFC 7672 §3).
