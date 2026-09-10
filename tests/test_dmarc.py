@@ -387,11 +387,8 @@ class Test(unittest.TestCase):
         DMARC record and is treated as unrelated"""
         for record in ("v=dmarc1; p=reject", "v=DMARC10; p=reject"):
             with patch("checkdmarc.dmarc.query_dns", return_value=[record]):
-                self.assertRaises(
-                    checkdmarc.dmarc.UnrelatedTXTRecordFoundAtDMARC,
-                    checkdmarc.dmarc._query_dmarc_record,
-                    "example.com",
-                )
+                result = checkdmarc.dmarc._query_dmarc_record("example.com")
+            self.assertIsNone(result)
 
     def testDMARCApexNXDOMAINKeepsFoundRecord(self):
         """An NXDOMAIN on the courtesy apex TXT query does not discard a
@@ -611,40 +608,47 @@ class Test(unittest.TestCase):
         )
 
     def testDMARCRecordStartsWithWhitespace(self):
-        """DMARC record with leading whitespace raises DMARCRecordStartsWithWhitespace"""
+        """Leading whitespace prevents a version match and the record is discarded."""
+        warnings = []
         with patch("checkdmarc.dmarc.query_dns") as mock_dns:
             mock_dns.return_value = [" v=DMARC1; p=reject"]
-            self.assertRaises(
-                checkdmarc.dmarc.DMARCRecordStartsWithWhitespace,
-                checkdmarc.dmarc._query_dmarc_record,
-                "example.com",
+            result = checkdmarc.dmarc._query_dmarc_record(
+                "example.com", warnings=warnings
             )
+        self.assertIsNone(result)
+        self.assertTrue(
+            any("starts with whitespace" in warning for warning in warnings)
+        )
 
     def testDMARCMultipleRecords(self):
-        """Multiple DMARC records raise MultipleDMARCRecords"""
+        """RFC 9989 discards all policy records when more than one matches."""
+        warnings = []
         with patch("checkdmarc.dmarc.query_dns") as mock_dns:
             mock_dns.return_value = [
                 "v=DMARC1; p=reject",
                 "v=DMARC1; p=none",
             ]
-            self.assertRaises(
-                checkdmarc.dmarc.MultipleDMARCRecords,
-                checkdmarc.dmarc._query_dmarc_record,
-                "example.com",
+            result = checkdmarc.dmarc._query_dmarc_record(
+                "example.com", warnings=warnings
             )
+        self.assertIsNone(result)
+        self.assertTrue(any("Multiple DMARC" in warning for warning in warnings))
 
     def testDMARCUnrelatedRecords(self):
-        """Unrelated TXT records at _dmarc raise UnrelatedTXTRecordFoundAtDMARC"""
+        """Unrelated TXT does not invalidate the one matching policy record."""
+        warnings = []
         with patch("checkdmarc.dmarc.query_dns") as mock_dns:
             mock_dns.return_value = [
                 "v=DMARC1; p=reject",
                 "some random txt record",
             ]
-            self.assertRaises(
-                checkdmarc.dmarc.UnrelatedTXTRecordFoundAtDMARC,
-                checkdmarc.dmarc._query_dmarc_record,
-                "example.com",
+            result = checkdmarc.dmarc._query_dmarc_record(
+                "example.com", warnings=warnings
             )
+        self.assertEqual(result, "v=DMARC1; p=reject")
+        self.assertTrue(
+            any("some random txt record" in warning for warning in warnings)
+        )
 
     def testDMARCUnrelatedRecordsIgnored(self):
         """Unrelated records are ignored when ignore_unrelated_records=True"""
@@ -896,6 +900,72 @@ class TestQueryDmarcRecordEdges(unittest.TestCase):
 class TestQueryDmarcRecordTreeWalk(unittest.TestCase):
     """query_dmarc_record DNS tree walk branches"""
 
+    def testDiscardedRecordsDoNotBlockParentPolicy(self):
+        """Discard nonmatching TXT and duplicate policies at every tree-walk step."""
+        discarded_sets = (
+            ["site-verification=123"],
+            ["v=DMARC1; p=none", "v=DMARC1; p=quarantine; psd=y"],
+            [" v=DMARC1; p=none; psd=n"],
+        )
+        policy = "v=DMARC1; p=reject; psd=n"
+        for discarded in discarded_sets:
+            with self.subTest(discarded=discarded):
+                answers = {
+                    "_dmarc.a.mail.example.com": discarded,
+                    "_dmarc.mail.example.com": discarded,
+                    "_dmarc.example.com": [policy],
+                }
+                with patch(
+                    "checkdmarc.dmarc.query_dns",
+                    side_effect=lambda target, *args, records=answers, **kwargs: (
+                        records.get(target, [])
+                    ),
+                ):
+                    result = checkdmarc.dmarc.check_dmarc("a.mail.example.com")
+                self.assertTrue(result["valid"], result)
+                self.assertEqual(result["location"], "example.com")
+                self.assertEqual(result["record"], policy)
+                warnings = cast(Any, result)["warnings"]
+                self.assertTrue(any("_dmarc.a.mail.example.com" in w for w in warnings))
+                self.assertTrue(any("_dmarc.mail.example.com" in w for w in warnings))
+
+    def testUnrelatedTxtBesideAuthorPolicyWarns(self):
+        """The public check keeps an author policy beside unrelated TXT."""
+        policy = "v=DMARC1; p=reject"
+        answers = {"_dmarc.example.com": ["site-verification=123", policy]}
+        for ignore in (False, True):
+            with (
+                self.subTest(ignore=ignore),
+                patch(
+                    "checkdmarc.dmarc.query_dns",
+                    side_effect=lambda target, *args, **kwargs: answers.get(target, []),
+                ),
+            ):
+                result = checkdmarc.dmarc.check_dmarc(
+                    "example.com", ignore_unrelated_records=ignore
+                )
+            self.assertTrue(result["valid"], result)
+            self.assertEqual(result["record"], policy)
+            self.assertEqual(result["location"], "example.com")
+            warnings = cast(Any, result)["warnings"]
+            self.assertEqual(
+                any("site-verification=123" in w for w in warnings), not ignore
+            )
+
+    def testDuplicateOnlyPolicyRetainsDiagnostic(self):
+        """When no parent policy exists, report no policy and the discarded RRset."""
+        answers = {"_dmarc.example.com": ["v=DMARC1; p=none", "v=DMARC1; p=reject"]}
+        with patch(
+            "checkdmarc.dmarc.query_dns",
+            side_effect=lambda target, *args, **kwargs: answers.get(target, []),
+        ):
+            result = checkdmarc.dmarc.check_dmarc("example.com")
+        self.assertFalse(result["valid"])
+        self.assertIsNone(result["record"])
+        failure = cast(Any, result)
+        self.assertIn("does not exist", failure["error"])
+        self.assertTrue(any("Multiple DMARC" in w for w in failure["warnings"]))
+
     def testWalkSucceedsAtParent(self):
         """If the subdomain has no record, the walk finds one at the parent"""
         with (
@@ -933,10 +1003,10 @@ class TestQueryDmarcRecordTreeWalk(unittest.TestCase):
         ):
             mock_query.side_effect = [
                 None,  # original
-                checkdmarc.dmarc.MultipleDMARCRecords("multiple at parent"),
+                checkdmarc.dmarc.DMARCError("DNS timeout at parent"),
             ]
             self.assertRaises(
-                checkdmarc.dmarc.MultipleDMARCRecords,
+                checkdmarc.dmarc.DMARCError,
                 checkdmarc.dmarc.query_dmarc_record,
                 "sub.example.com",
             )

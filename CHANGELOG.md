@@ -10,6 +10,7 @@
 
 ### Fixed
 
+- DMARC discovery discards unrelated TXT and duplicate policy sets, preserves warnings, and continues to applicable parent policies (RFC 9989 §4.10).
 - TLS reporting URIs accept valid HTTPS hosts and mailto components while rejecting malformed address escapes (RFC 8460 §3).
 - SPF `ptr` no longer invents void failures from target-domain addresses and reports the missing sender context (RFC 7208 §5.5).
 - SPF `exists` checks count missing A answers as void lookups and identify unresolved sender-dependent macros (RFC 7208 §5.7).

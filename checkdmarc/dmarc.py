@@ -160,12 +160,12 @@ class DMARCError(Exception):
 class DMARCRecordNotFound(DMARCError):
     """Raised when a DMARC record could not be found"""
 
-    def __init__(self, error):
+    def __init__(self, error, data: DMARCErrorData | None = None):
         # Round the timeout before stringifying, so the message shows the
         # rounded value
         if isinstance(error, dns.exception.Timeout):
             error.kwargs["timeout"] = round(error.kwargs["timeout"], 1)
-        super().__init__(str(error))
+        super().__init__(str(error), data=data)
 
 
 class DMARCSyntaxError(DMARCError):
@@ -181,7 +181,11 @@ class InvalidDMARCTagValue(DMARCSyntaxError):
 
 
 class DMARCRecordStartsWithWhitespace(DMARCSyntaxError):
-    """Raised when DMARC record starts with whitespace"""
+    """Legacy error for a DMARC record that starts with whitespace.
+
+    No longer raised during discovery: nonmatching records are discarded
+    with a warning under RFC 9989 section 4.10.
+    """
 
 
 class InvalidDMARCReportURI(InvalidDMARCTagValue):
@@ -189,7 +193,10 @@ class InvalidDMARCReportURI(InvalidDMARCTagValue):
 
 
 class UnrelatedTXTRecordFoundAtDMARC(DMARCError):
-    """Raised when a TXT record unrelated to DMARC is found"""
+    """Raised for unrelated TXT records in report authorization checks.
+
+    Policy discovery discards unrelated records with a warning instead.
+    """
 
 
 class SPFRecordFoundWhereDMARCRecordShouldBe(UnrelatedTXTRecordFoundAtDMARC):
@@ -214,10 +221,11 @@ class UnverifiedDMARCURIDestination(_DMARCWarning):
 
 
 class MultipleDMARCRecords(DMARCError):
-    """Raised when multiple DMARC records are found. RFC 9989 § 4.10
-    (steps 2 and 6) requires receivers to discard all of the records
-    when more than one is returned for a name, so publishing multiple
-    records disables DMARC (previously RFC 7489 § 6.6.3)"""
+    """Legacy error for multiple DMARC policy records at one name.
+
+    No longer raised during discovery: RFC 9989 section 4.10 requires
+    discarding all matching records at that name and continuing the walk.
+    """
 
 
 class _DMARCGrammar(pyleri.Grammar):
@@ -367,6 +375,7 @@ class _DMARCErrorResultsOptionalFields(TypedDict, total=False):
     """Optional fields for DMARCErrorResults"""
 
     target: str
+    warnings: list[str]
 
 
 class DMARCErrorResults(_DMARCErrorResultsOptionalFields):
@@ -382,6 +391,7 @@ class DMARCErrorData(TypedDict, total=False):
     """Optional data structure for DMARCError"""
 
     target: str
+    warnings: list[str]
 
 
 dmarc_tags: DMARCTagMap = {
@@ -750,6 +760,7 @@ def _query_dmarc_record(
     retries: int = DEFAULT_DNS_MAX_RETRIES,
     ignore_unrelated_records: bool = False,
     apex_fallback: bool = True,
+    warnings: list[str] | None = None,
 ) -> str | None:
     """
     Queries DNS for a DMARC record
@@ -761,13 +772,14 @@ def _query_dmarc_record(
                                           requests
         timeout (float): number of seconds to wait for an answer from DNS
         retries (int): The number of times to retry on timeout or other transient errors
-        ignore_unrelated_records (bool): Do not raise an error if unrelated TXT records are found
+        ignore_unrelated_records (bool): Suppress warnings for unrelated TXT records
         apex_fallback (bool): When ``_dmarc.{domain}`` has no answer, also
             query the apex of ``{domain}`` and raise
             ``DMARCRecordInWrongLocation`` if a ``v=DMARC1`` record is found
             there. Disabled during the RFC 9989 tree walk: misplaced apex
             records at parent domains are not the operator's concern when
             looking up the policy for a subdomain.
+        warnings (list): Append discovery warnings to this list when supplied
 
     Returns:
         str: A record string or None
@@ -777,6 +789,8 @@ def _query_dmarc_record(
     dmarc_record = None
     dmarc_records = []
     unrelated_records = []
+    if warnings is None:
+        warnings = []
 
     try:
         records = query_dns(
@@ -794,26 +808,29 @@ def _query_dmarc_record(
             if _is_dmarc_record(record):
                 dmarc_records.append(record)
             elif _is_dmarc_record(record.strip()):
-                raise DMARCRecordStartsWithWhitespace(
-                    f"Found a DMARC record at {target} that starts with whitespace. "
-                    "Please remove the whitespace, as some implementations "
-                    "may not process it correctly."
-                )
+                if not ignore_unrelated_records:
+                    warnings.append(
+                        f"A TXT record at {target} starts with whitespace and "
+                        "was ignored because it does not start with the DMARC "
+                        "version tag (RFC 9989 section 4.10)."
+                    )
             else:
                 unrelated_records.append(record)
 
-        if len(dmarc_records) > 1:
-            raise MultipleDMARCRecords(
-                "Multiple DMARC policy records are not permitted - "
-                "https://www.rfc-editor.org/rfc/rfc9989.html#section-4.10"
-            )
+        # RFC 9989 section 4.10 steps 2 and 6: discard unrelated TXT
+        # records, and discard all policy records when more than one
+        # matches at a name. Returning None lets policy discovery keep
+        # walking rather than losing an applicable parent policy.
         if len(unrelated_records) > 0 and not ignore_unrelated_records:
             ur_str = "\n\n".join(unrelated_records)
-            raise UnrelatedTXTRecordFoundAtDMARC(
-                "Unrelated TXT records were discovered. These should be "
-                "removed, as some receivers may not expect to find "
-                f"unrelated TXT records at {target}\n\n{ur_str}",
-                data={"target": target},
+            warnings.append(
+                f"Unrelated TXT records at {target} were ignored "
+                f"(RFC 9989 section 4.10):\n\n{ur_str}"
+            )
+        if len(dmarc_records) > 1:
+            warnings.append(
+                f"Multiple DMARC policy records at {target} were all ignored "
+                "(RFC 9989 section 4.10); discovery continues at parent domains."
             )
         if len(dmarc_records) == 1:
             dmarc_record = dmarc_records[0]
@@ -849,12 +866,6 @@ def _query_dmarc_record(
 
     except dns.resolver.NXDOMAIN:
         pass
-    except DMARCRecordStartsWithWhitespace:
-        raise
-    except UnrelatedTXTRecordFoundAtDMARC:
-        raise
-    except MultipleDMARCRecords:
-        raise
     except dns.exception.DNSException as error:
         raise DMARCError(str(error))
 
@@ -880,7 +891,7 @@ def query_dmarc_record(
                                           requests
         timeout (float): number of seconds to wait for an answer from DNS
         retries (int): The number of times to retry on timeout or other transient errors
-        ignore_unrelated_records (bool): Ignore unrelated TXT records
+        ignore_unrelated_records (bool): Suppress warnings for unrelated TXT records
 
     Returns:
         dict: a ``dict`` with the following keys:
@@ -891,7 +902,6 @@ def query_dmarc_record(
      Raises:
         :exc:`checkdmarc.dmarc.DMARCRecordNotFound`
         :exc:`checkdmarc.dmarc.DMARCRecordInWrongLocation`
-        :exc:`checkdmarc.dmarc.MultipleDMARCRecords`
         :exc:`checkdmarc.dmarc.SPFRecordFoundWhereDMARCRecordShouldBe`
 
     """
@@ -908,6 +918,7 @@ def query_dmarc_record(
             timeout=timeout,
             retries=retries,
             ignore_unrelated_records=ignore_unrelated_records,
+            warnings=warnings,
         )
     except DMARCRecordNotFound:
         # Skip this exception as we want to perform a tree walk. If we fail
@@ -969,6 +980,7 @@ def query_dmarc_record(
                         retries=retries,
                         ignore_unrelated_records=ignore_unrelated_records,
                         apex_fallback=False,
+                        warnings=warnings,
                     )
                 except DMARCRecordNotFound:
                     # No DMARC record at this parent; continue walking up the tree
@@ -1015,7 +1027,7 @@ def query_dmarc_record(
             error_str += "."
         else:
             error_str += " for this domain or its parent domains."
-        raise DMARCRecordNotFound(error_str)
+        raise DMARCRecordNotFound(error_str, data={"warnings": warnings})
 
     return {"record": record, "location": location, "warnings": warnings}
 
@@ -1729,7 +1741,6 @@ def get_dmarc_record(
     Raises:
         :exc:`checkdmarc.dmarc.DMARCRecordNotFound`
         :exc:`checkdmarc.dmarc.DMARCRecordInWrongLocation`
-        :exc:`checkdmarc.dmarc.MultipleDMARCRecords`
         :exc:`checkdmarc.dmarc.SPFRecordFoundWhereDMARCRecordShouldBe`
         :exc:`checkdmarc.dmarc.UnverifiedDMARCURIDestination`
         :exc:`checkdmarc.dmarc.DMARCSyntaxError`
@@ -1796,7 +1807,8 @@ def check_dmarc(
         domain (str): A domain name
         parked (bool): The domain is parked
         include_dmarc_tag_descriptions (bool): Include tag descriptions
-        ignore_unrelated_records (bool): Ignore unrelated TXT records
+        ignore_unrelated_records (bool): Suppress unrelated policy TXT warnings;
+            ignore unrelated TXT records in report authorization checks
         nameservers (list): A list of nameservers to query
         resolver (dns.resolver.Resolver): A resolver object to use for DNS
                                           requests
@@ -1836,6 +1848,8 @@ def check_dmarc(
             "valid": False,
             "error": str(error),
         }
+        if error.data and "warnings" in error.data:
+            error_results["warnings"] = error.data["warnings"]
         return error_results
     try:
         parsed_dmarc_record = parse_dmarc_record(
