@@ -423,6 +423,23 @@ def parse_mta_sts_record(
     record = record.strip('"')
     if record.lower().startswith("v=spf1"):
         raise SPFRecordFoundWhereMTASTSRecordShouldBe(_SPF_IN_MTA_STS_ERROR_MSG)
+    # RFC 8461 section 3.1 allows only SP/HTAB around semicolons. Pyleri
+    # automatically skips Python whitespace before tokens and after the
+    # record, so check both its characters and position before parsing.
+    for whitespace in re.finditer(r"\s+", record):
+        before = record[whitespace.start() - 1 : whitespace.start()]
+        after = record[whitespace.end() : whitespace.end() + 1]
+        if whitespace.group().strip(" \t") or (before != ";" and after != ";"):
+            marked_record = (
+                record[: whitespace.start()]
+                + syntax_error_marker
+                + record[whitespace.start() :]
+            )
+            raise MTASTSRecordSyntaxError(
+                "Only spaces and horizontal tabs around semicolons are allowed "
+                "in MTA-STS records (RFC 8461 section 3.1): "
+                f"{marked_record}"
+            )
     if record.startswith("v=STSv1") and not record.startswith("v=STSv1;"):
         # The RFC 8461 section 3.1 ABNF allows WSP before the ";"
         # (sts-field-delim = *WSP ";" *WSP), but the same section's prose
@@ -571,18 +588,16 @@ def parse_mta_sts_policy(policy: str) -> MTASTSPolicyParsingResults:
     # the loop, so a missing key is reported instead of silently defaulted
     values: dict[str, str | int] = {}
     seen_keys: set[str] = set()
-    # RFC 8461 section 3.2: each line may end with either LF or CRLF, so
-    # mixed line endings within one policy file are acceptable. Split only
-    # on LF and drop the one CR belonging to a CRLF: str.splitlines()
-    # would also split on separators the RFC does not allow (vertical
-    # tab, form feed, U+2028), and rstrip("\r") would remove every
-    # trailing CR, hiding invalid endings such as CR CR LF. Any CR left
-    # after removing the CRLF one is a stray control character the
-    # sts-policy-value grammar forbids, so reject it here — the later
-    # .strip() on each value would silently discard it otherwise.
+    # RFC 8461 section 3.2 permits LF or CRLF between fields and one
+    # optional final terminator. Remove CR only when followed by LF;
+    # a final bare CR or an empty line must not disappear during parsing.
     lines = []
-    for line_index, raw_line in enumerate(policy.split("\n")):
-        line = raw_line.removesuffix("\r")
+    raw_lines = policy.split("\n") if policy else []
+    for line_index, raw_line in enumerate(raw_lines):
+        followed_by_lf = line_index < len(raw_lines) - 1
+        if not followed_by_lf and raw_line == "":
+            continue
+        line = raw_line.removesuffix("\r") if followed_by_lf else raw_line
         if "\r" in line:
             raise MTASTSPolicySyntaxError(
                 f"Line {line_index + 1}: A carriage return that is not part "
@@ -591,8 +606,6 @@ def parse_mta_sts_policy(policy: str) -> MTASTSPolicyParsingResults:
         lines.append(line)
     for i in range(len(lines)):
         line_number = i + 1
-        if lines[i] == "":
-            continue
         # Split on the first colon only, so values containing colons
         # (allowed in extension values) still form a key: value pair
         key_value = lines[i].split(":", 1)
@@ -610,7 +623,10 @@ def parse_mta_sts_policy(policy: str) -> MTASTSPolicyParsingResults:
                 "field name or between the name and the colon "
                 "(RFC 8461 section 3.2)."
             )
-        value = key_value[1].strip()
+        # WSP is only SP/HTAB, not every character Python considers
+        # whitespace. Preserve other characters so validation rejects
+        # malformed known values and retains valid UTF-8 extension values.
+        value = key_value[1].strip(" \t")
         if key not in known_keys:
             # RFC 8461 section 3.2: unknown fields SHALL be ignored, not
             # rejected — but only when they are syntactically valid

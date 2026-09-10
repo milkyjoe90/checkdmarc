@@ -78,6 +78,28 @@ class Test(unittest.TestCase):
         self.assertEqual(result["tags"]["id"], "foo")
         self.assertTrue(any("duplicate id" in w.lower() for w in result["warnings"]))
 
+    def testParseMtaStsRecordWhitespace(self):
+        """TXT whitespace is SP/HTAB around semicolons, including the last one."""
+        result = checkdmarc.mta_sts.parse_mta_sts_record(
+            "v=STSv1;\tid=abc \t; \textension=value;\t"
+        )
+        self.assertEqual(result["tags"], {"v": "STSv1", "id": "abc"})
+        self.assertIn("extension", result["warnings"][0])
+        for record in (
+            " v=STSv1; id=abc",
+            "v=STSv1; id=abc ",
+            "v=STSv1;\nid=abc",
+            "v=STSv1;\vid=abc",
+            "v=STSv1;\fid=abc",
+            "v=STSv1;\u00a0id=abc",
+            "v=STSv1; id=abc;\r\n",
+        ):
+            with (
+                self.subTest(record=record),
+                self.assertRaises(checkdmarc.mta_sts.MTASTSRecordSyntaxError),
+            ):
+                checkdmarc.mta_sts.parse_mta_sts_record(record)
+
     def testParseMtaStsPolicy(self):
         """parse_mta_sts_policy parses a valid policy"""
         policy = "version: STSv1\r\nmode: enforce\r\nmax_age: 86400\r\nmx: mail.example.com\r\n"
@@ -154,6 +176,54 @@ class Test(unittest.TestCase):
         self.assertEqual(result["policy"]["mode"], "enforce")
         self.assertEqual(result["policy"]["max_age"], 86400)
         self.assertEqual(result["policy"]["mx"], ["mail.example.com"])
+
+    def testParseMtaStsPolicyWhitespace(self):
+        """Invalid whitespace must not turn into a valid policy after trimming."""
+        base = "version: STSv1\nmode: enforce\nmax_age: 86400\nmx: mail.example.com\n"
+        for policy in (
+            base.replace("mode: enforce", "mode: \venforce"),
+            base.replace("mode: enforce", "mode: enforce\f"),
+            base.replace("mode: enforce", "mode: \u00a0enforce"),
+            base.replace("max_age: 86400", "max_age: 86400\u2028"),
+            base.rstrip("\n") + "\r",
+            "\n" + base,
+            base.replace("mode: enforce\n", "mode: enforce\n\n"),
+            base + "\n",
+            base + "extension: \vvalue\n",
+        ):
+            with (
+                self.subTest(policy=policy),
+                self.assertRaises(checkdmarc.mta_sts.MTASTSPolicySyntaxError),
+            ):
+                checkdmarc.mta_sts.parse_mta_sts_policy(policy)
+
+        result = checkdmarc.mta_sts.parse_mta_sts_policy(
+            base.replace("mode: enforce", "mode:\tenforce\t")
+            + "extension: \u00a0value\u00a0\n"
+        )
+        self.assertEqual(result["policy"]["mode"], "enforce")
+        self.assertEqual(
+            result["warnings"], ["Line 5: Unknown key extension was ignored."]
+        )
+
+    def testCheckMtaStsRejectsMalformedWhitespace(self):
+        """Malformed DNS and policy inputs must surface as invalid to customers."""
+        policy = "version: STSv1\nmode: enforce\nmax_age: 86400\nmx: mail.example.com\n"
+        for record, body in (
+            ("v=STSv1;\nid=a", policy),
+            ("v=STSv1; id=a", policy.replace("mode: enforce", "mode: \venforce")),
+        ):
+            with (
+                self.subTest(record=record, body=body),
+                patch("checkdmarc.mta_sts.query_dns", return_value=[record]),
+                patch(
+                    "checkdmarc.mta_sts.download_mta_sts_policy",
+                    return_value={"policy": body, "warnings": []},
+                ),
+            ):
+                result = checkdmarc.mta_sts.check_mta_sts("example.com")
+                self.assertFalse(result["valid"])
+                self.assertTrue(result.get("error"))
 
     def testParseMtaStsPolicyInvalidMaxAge(self):
         """parse_mta_sts_policy raises error for negative max_age"""
