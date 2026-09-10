@@ -147,15 +147,20 @@ class TestQueryDns(unittest.TestCase):
         self.assertEqual(result, ["ns1.example.com", "ns2.example.com"])
 
     def testCacheHit(self):
-        """A populated cache short-circuits the DNS lookup"""
+        """A previously resolved answer remains available during its TTL."""
         cache = ExpiringDict(max_len=10, max_age_seconds=60)
-        cache["example.com_TXT_False"] = ["cached value"]
         fake_resolver = _fake_resolver()
+        fake_resolver.resolve.return_value = dns.rrset.from_text(
+            "example.com", 300, "IN", "TXT", '"cached value"'
+        )
+        checkdmarc.utils.query_dns(
+            "example.com", "TXT", resolver=fake_resolver, cache=cache
+        )
+        fake_resolver.resolve.side_effect = dns.resolver.LifetimeTimeout()
         result = checkdmarc.utils.query_dns(
             "example.com", "TXT", resolver=fake_resolver, cache=cache
         )
         self.assertEqual(result, ["cached value"])
-        fake_resolver.resolve.assert_not_called()
 
     def testRetryOnTransientError(self):
         """LifetimeTimeout is retried up to ``retries`` times"""

@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- DNS and MX caches now honor answer TTLs, including alias-chain TTLs, and isolate resolver configurations (RFC 1035 §4.1.3).
 - Reject malformed MTA-STS record whitespace and policy line endings (RFC 8461 §§3.1–3.2).
 
 ## 6.0.1

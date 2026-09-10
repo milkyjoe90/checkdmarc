@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
+import time
 import unicodedata
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import TypedDict
 from urllib.parse import urlsplit
 
@@ -48,6 +51,70 @@ logger = logging.getLogger(__name__)
 DNS_CACHE = ExpiringDict(
     max_len=DNS_CACHE_MAX_LEN, max_age_seconds=DNS_CACHE_MAX_AGE_SECONDS
 )
+
+
+@dataclass(frozen=True)
+class _DNSCacheEntry:
+    value: object
+    expires_at: float
+
+
+def _nameserver_cache_key(nameservers: Sequence[str | Nameserver]) -> tuple[str, ...]:
+    """Include transport, endpoint, and TLS verification settings in DNS cache keys."""
+    return tuple(
+        server
+        if isinstance(server, str)
+        else f"{type(server).__module__}.{type(server).__qualname__}:{vars(server)!r}"
+        for server in nameservers
+    )
+
+
+def _get_cached_dns(cache: ExpiringDict, key: tuple) -> object | None:
+    entry = cache.get(key)
+    if isinstance(entry, _DNSCacheEntry) and entry.expires_at > time.time():
+        return entry.value
+    return None
+
+
+def _cache_dns(
+    cache: ExpiringDict, key: tuple, value: object, expires_at: float
+) -> None:
+    # RFC 1035 section 4.1.3: a zero-TTL answer is usable only for this
+    # transaction. ExpiringDict's configured maximum age is an additional
+    # upper bound; it must never extend the DNS answer's lifetime.
+    if math.isfinite(expires_at) and expires_at > time.time():
+        cache[key] = _DNSCacheEntry(value, expires_at)
+
+
+def _answer_expiration(answer: dns.resolver.Answer) -> float:
+    # dnspython already includes the shortest CNAME/DNAME chain TTL in
+    # Answer.expiration. A bare RRset is also useful to custom resolvers.
+    expiration = getattr(answer, "expiration", None)
+    if isinstance(expiration, (int, float)):
+        return expiration
+    ttl = getattr(answer, "ttl", 0)
+    return time.time() + ttl if isinstance(ttl, (int, float)) else 0.0
+
+
+def _resolver_cache_key(
+    resolver: dns.resolver.Resolver, supplied_resolver: dns.resolver.Resolver | None
+) -> tuple:
+    # Keep caller-provided resolvers isolated even when they advertise the
+    # same nameservers (they may implement different split-DNS views).
+    return (
+        supplied_resolver,
+        _nameserver_cache_key(resolver.nameservers),
+        repr(getattr(resolver, "nameserver_ports", None)),
+        repr(getattr(resolver, "port", None)),
+        repr(getattr(resolver, "flags", None)),
+        repr(getattr(resolver, "edns", None)),
+        repr(getattr(resolver, "ednsflags", None)),
+        repr(getattr(resolver, "ednsoptions", None)),
+        repr(getattr(resolver, "domain", None)),
+        repr(getattr(resolver, "search", None)),
+        repr(getattr(resolver, "use_search_by_default", None)),
+    )
+
 
 # The process-wide httpx client used for DNS over HTTPS queries, and the PID
 # it was created under. See _get_doh_session().
@@ -383,13 +450,9 @@ def query_dns(
     """
     domain = normalize_domain(domain)
     record_type = record_type.upper()
-    cache_key = f"{domain}_{record_type}_{quoted_txt_segments}"
     if cache is None:
         cache = DNS_CACHE
-    if isinstance(cache, ExpiringDict):
-        records = cache.get(cache_key)
-        if isinstance(records, list):
-            return records
+    supplied_resolver = resolver
     if not resolver:
         resolver = dns.resolver.Resolver()
         timeout = float(timeout)
@@ -406,22 +469,25 @@ def query_dns(
             resolver.lifetime = timeout * len(resolver.nameservers)
         else:
             resolver.lifetime = timeout
-    if record_type == "TXT":
+    cache_key = (
+        domain,
+        record_type,
+        quoted_txt_segments,
+        _resolver_cache_key(resolver, supplied_resolver),
+    )
+    records = _get_cached_dns(cache, cache_key)
+    if isinstance(records, list):
+        return records
+    attempt = _attempt
+    while True:
         try:
             answers = resolver.resolve(domain, record_type, lifetime=resolver.lifetime)
+            break
         except _RETRYABLE_DNS_ERRORS:
-            _attempt += 1
-            if _attempt > retries:
+            attempt += 1
+            if attempt > retries:
                 raise
-            return query_dns(
-                domain,
-                record_type,
-                nameservers=nameservers,
-                resolver=resolver,
-                timeout=timeout,
-                retries=retries,
-                _attempt=_attempt,
-            )
+    if record_type == "TXT":
         resource_records = [r.strings for r in answers]
         if quoted_txt_segments:
             # Join each sequence of byte chunks, adding quotes around each
@@ -445,24 +511,8 @@ def query_dns(
                 r = "Undecodable characters"
             records.append(r)
     else:
-        try:
-            answers = resolver.resolve(domain, record_type, lifetime=resolver.lifetime)
-        except _RETRYABLE_DNS_ERRORS:
-            _attempt += 1
-            if _attempt > retries:
-                raise
-            return query_dns(
-                domain,
-                record_type,
-                nameservers=nameservers,
-                resolver=resolver,
-                timeout=timeout,
-                retries=retries,
-                _attempt=_attempt,
-            )
         records = [r.to_text().rstrip(".") for r in answers]
-    if type(cache) is ExpiringDict:
-        cache[cache_key] = records
+    _cache_dns(cache, cache_key, records, _answer_expiration(answers))
 
     return records
 
@@ -781,10 +831,7 @@ def _resolve_mx_rdatas(
     setup, caching, and retry behavior mirror ``query_dns()``.
     """
     domain = normalize_domain(domain)
-    cache_key = f"{domain}_MX_parsed"
-    cached = DNS_CACHE.get(cache_key)
-    if isinstance(cached, list):
-        return cached
+    supplied_resolver = resolver
     if not resolver:
         resolver = dns.resolver.Resolver()
         timeout = float(timeout)
@@ -796,6 +843,10 @@ def _resolve_mx_rdatas(
             resolver.lifetime = timeout * len(resolver.nameservers)
         else:
             resolver.lifetime = timeout
+    cache_key = (domain, "MX_parsed", _resolver_cache_key(resolver, supplied_resolver))
+    cached = _get_cached_dns(DNS_CACHE, cache_key)
+    if isinstance(cached, list):
+        return cached
     attempts = 0
     while True:
         try:
@@ -806,7 +857,7 @@ def _resolve_mx_rdatas(
             if attempts > retries:
                 raise
     records = [(int(rdata.preference), rdata.exchange.to_text()) for rdata in answers]
-    DNS_CACHE[cache_key] = records
+    _cache_dns(DNS_CACHE, cache_key, records, _answer_expiration(answers))
     return records
 
 
