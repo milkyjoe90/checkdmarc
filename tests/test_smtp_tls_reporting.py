@@ -268,6 +268,137 @@ class Test(unittest.TestCase):
             "v=TLSRPTv1; rua=https://example.com/a#one#two",
         )
 
+    def testMailtoUriAddressAndHeaderGrammar(self):
+        """RFC 6068 addresses, escaped quoted strings, and headers survive parsing."""
+        uris = (
+            "mailto:tls@example.com?subject=TLS",
+            "mailto:tls@example.com?subject=caf%C3%A9&body=one%0D%0Atwo",
+            "mailto:tls@example.com?cc=other@example.com&body=a%26b%3Dc%23d",
+            "mailto:tls%26reports@example.com",
+            "mailto:tls%3Dreports@example.com",
+            "mailto:tls%2Freports@example.com",
+            "mailto:tls%3Freports@example.com",
+            "mailto:tls%2521reports@example.com",
+            "mailto:%22not%40me%22@example.org",
+            "mailto:%22oh%5C%5Cno%22@example.org",
+            "mailto:%22space%20and%2Ccomma%22@example.org",
+            "mailto:%22%5C%22quoted%5C%22%22@example.org",
+            "mailto:tls@%5BIPv6:2001:db8::1%5D",
+            "mailto:tls@%E7%B4%8D%E8%B1%86.example.org",
+            "mailto:t%C3%A9st@example.org",
+            "MAILTO:tls@example.org",
+            "mailto:?to=tls@example.org",
+        )
+        for uri in uris:
+            with self.subTest(uri=uri):
+                result = checkdmarc.smtp_tls_reporting.parse_smtp_tls_reporting_record(
+                    f"v=TLSRPTv1; rua={uri}"
+                )
+                self.assertEqual(result["tags"]["rua"]["value"], [uri])
+                self.assertEqual(result["warnings"], [])
+
+    def testInvalidMailtoAddressAndHeaderGrammar(self):
+        """URI escapes must also decode to legal address and header components."""
+        uris = (
+            "mailto:tls=reports@example.com",
+            "mailto:tls&reports@example.com",
+            "mailto:tls/reports@example.com",
+            "mailto:tls(reports)@example.com",
+            "mailto:tls%20reports@example.com",
+            "mailto:tls%00reports@example.com",
+            "mailto:tls%0Areports@example.com",
+            "mailto:tls%40reports@example.com",
+            "mailto:tls%2Creports@example.com",
+            "mailto:tls%3Breports@example.com",
+            "mailto:tls%2E%2Ereports@example.com",
+            "mailto:%22unclosed@example.com",
+            "mailto:%22control%7F%22@example.com",
+            "mailto:%22control%0A%22@example.com",
+            "mailto:tls@example..com",
+            "mailto:tls@example.com.",
+            "mailto:tls@%5Bbad%5Cliteral%5D",
+            "mailto:tls@[2001:db8::1]",
+            "mailto:tls%40example.com",
+            "mailto:tls@example.com?subject",
+            "mailto:tls@example.com?subject=one=two",
+            "mailto:tls@example.com?subject=one?body=two",
+            "mailto:tls@example.com?subject=one&",
+            "mailto:tls@example.com?subject=%FF",
+            "mailto:tls@example.com?subject=bad%2",
+            "mailto:tls%FF@example.com",
+            "mailto:tls@%C0%AF.example.com",
+            "mailto:tést@example.com",
+        )
+        for uri in uris:
+            with (
+                self.subTest(uri=uri),
+                self.assertRaises(
+                    checkdmarc.smtp_tls_reporting.SMTPTLSReportingSyntaxError
+                ),
+            ):
+                checkdmarc.smtp_tls_reporting.parse_smtp_tls_reporting_record(
+                    f"v=TLSRPTv1; rua={uri}"
+                )
+
+    def testHttpsUriComponents(self):
+        """RFC 3986 syntax permits fully qualified and encoded host names."""
+        uris = (
+            "https://reports.example.com./tls",
+            "https://%72eports.example.com/tls",
+            "https://reports.example.com:/tls",
+            "https://reports.example.com:443/tls",
+            "https://[v1.future:address]/tls",
+            "https://reports.example.com/a%2Cb%21c%3Bd?x=y&z=two#part",
+            "https://reports.example.com//a/b?next=/c?d#e/f?g",
+            "HTTPS://REPORTS.EXAMPLE.COM?",
+        )
+        for uri in uris:
+            with self.subTest(uri=uri):
+                result = checkdmarc.smtp_tls_reporting.parse_smtp_tls_reporting_record(
+                    f"v=TLSRPTv1; rua={uri}"
+                )
+                self.assertEqual(result["tags"]["rua"]["value"], [uri])
+
+    def testInvalidHttpsUriComponents(self):
+        """Reject invalid escaping, delimiters, authority, and raw Unicode."""
+        uris = (
+            "https:///tls",
+            "https://:443/tls",
+            "https://reports.example.com:bad/tls",
+            "https://reports.example.com:443:80/tls",
+            "https://user@reports.example.com/tls",
+            "https://reports.example.com/a!b",
+            "https://reports.example.com/a%2",
+            "https://reports.example.com/a%GG",
+            "https://%FF.example.com/tls",
+            "https://reports.example.com/a[b]",
+            "https://reports.example.com/a\\b",
+            "https://[v.future]/tls",
+            "https://[v1.]/tls",
+            "https://[2001:db8::1]extra/tls",
+            "https://réports.example.com/tls",
+            "https://reportſ.example.com/tls",
+        )
+        for uri in uris:
+            with (
+                self.subTest(uri=uri),
+                self.assertRaises(
+                    checkdmarc.smtp_tls_reporting.SMTPTLSReportingSyntaxError
+                ),
+            ):
+                checkdmarc.smtp_tls_reporting.parse_smtp_tls_reporting_record(
+                    f"v=TLSRPTv1; rua={uri}"
+                )
+
+    def testMailtoFragmentWarns(self):
+        """RFC 6068 recommends ignoring a syntactically valid URI fragment."""
+        uri = "mailto:tls@example.com#ignored"
+        result = checkdmarc.smtp_tls_reporting.parse_smtp_tls_reporting_record(
+            f"v=TLSRPTv1; rua={uri}"
+        )
+        self.assertEqual(result["tags"]["rua"]["value"], [uri])
+        self.assertTrue(any("fragment" in warning for warning in result["warnings"]))
+
 
 class TestQuerySmtpTlsReportingRecord(unittest.TestCase):
     def testDiscoveryAcceptsWspBeforeDelimiter(self):
@@ -396,6 +527,31 @@ class TestQuerySmtpTlsReportingRecord(unittest.TestCase):
 
 
 class TestCheckSmtpTlsReportingSuccess(unittest.TestCase):
+    def testReportUriValidationReachesCheckResult(self):
+        """The public check preserves valid URI text and reports invalid addresses."""
+        valid_uri = "mailto:tls%26reports@example.com?subject=TLS"
+        with patch(
+            "checkdmarc.smtp_tls_reporting.query_dns",
+            return_value=[f"v=TLSRPTv1; rua={valid_uri}"],
+        ):
+            result = checkdmarc.smtp_tls_reporting.check_smtp_tls_reporting(
+                "example.com"
+            )
+        self.assertTrue(result["valid"])
+        success = cast(Any, result)
+        self.assertEqual(success["tags"]["rua"]["value"], [valid_uri])
+
+        invalid_uri = "mailto:tls&reports@example.com"
+        with patch(
+            "checkdmarc.smtp_tls_reporting.query_dns",
+            return_value=[f"v=TLSRPTv1; rua={invalid_uri}"],
+        ):
+            result = checkdmarc.smtp_tls_reporting.check_smtp_tls_reporting(
+                "example.com"
+            )
+        self.assertFalse(result["valid"])
+        self.assertIn(invalid_uri, cast(Any, result)["error"])
+
     def testFullSuccess(self):
         """check_smtp_tls_reporting end-to-end with valid record returns valid=True"""
         with patch(

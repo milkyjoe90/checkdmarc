@@ -7,6 +7,7 @@ import logging
 import re
 from collections.abc import Sequence
 from typing import Literal, TypedDict
+from urllib.parse import unquote
 
 import dns.exception
 import dns.resolver
@@ -43,35 +44,36 @@ logger = logging.getLogger(__name__)
 # The RFC 8460 section 3 grammar uses RFC 7405 %s (case-sensitive) strings,
 # so "v=TLSRPTv1" must appear exactly, with no whitespace around the "=".
 SMTPTLSREPORTING_VERSION_REGEX_STRING = r"v=TLSRPTv1"
-# RFC 8460 section 3: a tlsrpt-uri is an RFC 3986 URI in which ",", "!",
-# and ";" must be percent-encoded. These local patterns accept RFC 3986
-# characters minus those three, with "%" only as a two-hex-digit escape.
-# The shared utils regexes are unsuitable here: HTTPS_REGEX allows raw
-# spaces, and MAILTO_REGEX_STRING allows raw "!" plus the DMARC-only
-# "!size" suffix, which RFC 8460 does not define.
-# The local part is dot-separated atoms: RFC 6068 mailto URIs carry an
-# RFC 5322 addr-spec, whose dot-atom form requires a nonempty run of atom
-# characters between dots, so a leading, trailing, or doubled dot (e.g.
-# mailto:.alerts@example.com) is invalid.
-_TLSRPT_MAILTO_ATOM = r"(?:[A-Za-z0-9\-_~$&'()*+=]|%[0-9A-Fa-f]{2})+"
+# RFC 8460 section 3 imports RFC 3986 URI syntax, but requires ",", "!",
+# and ";" to be percent-encoded even where the URI scheme permits them.
+_TLSRPT_UNRESERVED = r"A-Za-z0-9\-._~"
+_TLSRPT_SUB_DELIMS = r"$&'()*+="
+_TLSRPT_PCT = r"%[0-9A-Fa-f]{2}"
+_TLSRPT_PCHAR = rf"(?:[{_TLSRPT_UNRESERVED}{_TLSRPT_SUB_DELIMS}:@]|{_TLSRPT_PCT})"
+_TLSRPT_URI_CHAR = rf"(?:{_TLSRPT_PCHAR}|[/?])"
+
+# RFC 6068 section 2 requires address "&" and "=" characters to be
+# escaped. Its hfields grammar uses these characters only as separators.
+# Check the decoded address separately, since encoded punctuation can
+# belong to a quoted local part but not to a dot-atom local part.
+_TLSRPT_MAILTO_QCHAR = rf"(?:[{_TLSRPT_UNRESERVED}$'()*+:@]|{_TLSRPT_PCT})"
 TLSRPT_MAILTO_REGEX_STRING = (
-    rf"mailto:{_TLSRPT_MAILTO_ATOM}(?:\.{_TLSRPT_MAILTO_ATOM})*"
-    r"@(?:[A-Za-z0-9\-]+\.)*[A-Za-z0-9\-]+"
+    rf"mailto:(?P<mailto_to>{_TLSRPT_MAILTO_QCHAR}*)"
+    rf"(?:\?(?P<mailto_headers>{_TLSRPT_MAILTO_QCHAR}*={_TLSRPT_MAILTO_QCHAR}*"
+    rf"(?:&{_TLSRPT_MAILTO_QCHAR}*={_TLSRPT_MAILTO_QCHAR}*)*))?"
+    rf"(?:#(?P<mailto_fragment>{_TLSRPT_URI_CHAR}*))?"
 )
-# Path, query, and fragment characters per RFC 3986: pchar plus "/" and
-# "?", minus the ",", "!", and ";" that RFC 8460 requires percent-encoded.
-# "#" is excluded because RFC 3986 allows it only once, as the fragment
-# delimiter, and "[" / "]" are legal only in an IP-literal host.
-_TLSRPT_URI_CHAR = r"(?:[A-Za-z0-9\-._~$&'()*+=:@/?]|%[0-9A-Fa-f]{2})"
-# The https authority may be a hostname (one or more labels) or a
-# bracketed IPv6 literal, per the RFC 3986 authority grammar. The bracket
-# branch only checks the character shape; parse_smtp_tls_reporting_record
-# checks the captured text against the ipaddress module, because a full
-# RFC 4291 IPv6 grammar is impractical in a regular expression.
+
+# RFC 3986 section 3.2 permits a trailing dot or percent-encoded host,
+# IPv6 / IPvFuture literals, and an empty port. HTTPS requires a nonempty
+# host and deprecates userinfo (RFC 9110 sections 4.2.2 and 4.2.4).
 TLSRPT_HTTPS_REGEX_STRING = (
-    r"https://(?:\[(?P<ipv6>[0-9A-Fa-f:.]+)\]|(?:[A-Za-z0-9\-]+\.)*[A-Za-z0-9\-]+)"
-    r"(?::[0-9]{1,5})?"
-    rf"(?:[/?]{_TLSRPT_URI_CHAR}*)?"
+    r"https://(?:\[(?P<ipv6>[0-9A-Fa-f:.]+)\]"
+    rf"|\[v[0-9A-Fa-f]+\.[{_TLSRPT_UNRESERVED}{_TLSRPT_SUB_DELIMS}:]+\]"
+    rf"|(?P<https_host>(?:[{_TLSRPT_UNRESERVED}{_TLSRPT_SUB_DELIMS}]|{_TLSRPT_PCT})+))"
+    r"(?::[0-9]*)?"
+    rf"(?:/{_TLSRPT_PCHAR}*)*"
+    rf"(?:\?{_TLSRPT_URI_CHAR}*)?"
     rf"(?:#{_TLSRPT_URI_CHAR}*)?"
 )
 SMTPTLSREPORTING_URI_REGEX_STRING = (
@@ -106,8 +108,41 @@ SMTPTLSREPORTING_FIELD_DELIMITER_REGEX = re.compile(
 SMTPTLSREPORTING_URI_DELIMITER_REGEX = re.compile(rf"{WSP_REGEX}*,{WSP_REGEX}*")
 
 SMTPTLSREPORTING_URI_REGEX = re.compile(
-    SMTPTLSREPORTING_URI_REGEX_STRING, re.IGNORECASE
+    SMTPTLSREPORTING_URI_REGEX_STRING, re.IGNORECASE | re.ASCII
 )
+
+# RFC 6068 section 2 uses RFC 5322 section 3.2.3 dot-atom-text and
+# section 3.2.4 quoted-string, without comments or obsolete controls.
+# RFC 6068 requires UTF-8 for non-ASCII escapes, reserving their use in
+# local parts for internationalization extensions. Accept their URI
+# syntax here without claiming delivery support. These patterns apply
+# after exactly one strict UTF-8 decode.
+_TLSRPT_ADDRESS_ATOM = r"[A-Za-z0-9!#$%&'*+\-/=?^_`{|}~\x80-\U0010ffff]+"
+_TLSRPT_DOT_ATOM = rf"{_TLSRPT_ADDRESS_ATOM}(?:\.{_TLSRPT_ADDRESS_ATOM})*"
+_TLSRPT_LOCAL_PART = re.compile(
+    rf'(?:{_TLSRPT_DOT_ATOM}|"(?:[\x20-\x21\x23-\x5b\x5d-\x7e\x80-\U0010ffff]'
+    r'|\\[\x20-\x7e])*")'
+)
+_TLSRPT_MAIL_DOMAIN = re.compile(rf"(?:{_TLSRPT_DOT_ATOM}|\[[\x21-\x5a\x5e-\x7e]*\])")
+
+
+def _valid_mailto_address(address: str) -> bool:
+    """Validate an encoded RFC 6068 recipient without sending any mail."""
+    # The optional recipient may instead be supplied in a to header.
+    if not address:
+        return True
+    local_part, separator, domain = address.rpartition("@")
+    if not separator:
+        return False
+    try:
+        local_part = unquote(local_part, errors="strict")
+        domain = unquote(domain, errors="strict")
+    except UnicodeDecodeError:
+        return False
+    return (
+        _TLSRPT_LOCAL_PART.fullmatch(local_part) is not None
+        and _TLSRPT_MAIL_DOMAIN.fullmatch(domain) is not None
+    )
 
 
 class SMTPTLSReportingError(Exception):
@@ -518,6 +553,27 @@ def parse_smtp_tls_reporting_record(
             try:
                 ipaddress.IPv6Address(match.group("ipv6"))
             except ValueError:
+                valid = False
+        if match is not None and match.group("mailto_to") is not None:
+            valid = _valid_mailto_address(match.group("mailto_to"))
+            # RFC 6068 section 2 permits UTF-8 percent-encoding in header
+            # fields. Decode once to validate the encoding, without
+            # treating decoded delimiters as new URI structure.
+            try:
+                unquote(match.group("mailto_headers") or "", errors="strict")
+            except UnicodeDecodeError:
+                valid = False
+            if match.group("mailto_fragment") is not None:
+                warnings.append(
+                    f"The fragment in {uri} has no meaning for mailto URIs "
+                    "and should be ignored (RFC 6068 section 2)."
+                )
+        if match is not None and match.group("https_host") is not None:
+            # RFC 3986 section 3.2.2 allows percent-encoded UTF-8 in a
+            # registered host name, not arbitrary non-UTF-8 octets.
+            try:
+                unquote(match.group("https_host"), errors="strict")
+            except UnicodeDecodeError:
                 valid = False
         if not valid:
             raise SMTPTLSReportingSyntaxError(
