@@ -1066,7 +1066,7 @@ class TestQueryDmarcRecordTreeWalk(unittest.TestCase):
             )
 
     def testRootRecordsNXDOMAINRaises(self):
-        """An NXDOMAIN looking up the apex TXT records raises DMARCRecordNotFound"""
+        """NXDOMAIN with no parent policy still produces DMARCRecordNotFound."""
 
         def fake_query_dns(target, rdtype, **kwargs):
             raise dns.resolver.NXDOMAIN()
@@ -1080,6 +1080,40 @@ class TestQueryDmarcRecordTreeWalk(unittest.TestCase):
                 checkdmarc.dmarc.query_dmarc_record,
                 "example.com",
             )
+
+    def testNonexistentSubdomainInheritsParentPolicy(self):
+        """An apex NXDOMAIN must not hide the parent's non-existent-subdomain policy."""
+        policy = "v=DMARC1; p=none; sp=quarantine; np=reject; psd=n"
+        for selector_error in (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+            with self.subTest(selector_error=selector_error):
+
+                def query(target, *args, error_type=selector_error, **kwargs):
+                    if target == "_dmarc.missing.example.com":
+                        raise error_type()
+                    if target == "missing.example.com":
+                        raise dns.resolver.NXDOMAIN()
+                    if target == "_dmarc.example.com":
+                        return [policy]
+                    return []
+
+                with patch("checkdmarc.dmarc.query_dns", side_effect=query):
+                    result = checkdmarc.dmarc.check_dmarc("missing.example.com")
+                self.assertTrue(result["valid"], result)
+                self.assertEqual(result["record"], policy)
+                self.assertEqual(result["location"], "example.com")
+                success = cast(Any, result)
+                self.assertEqual(success["tags"]["np"]["value"], "reject")
+                self.assertTrue(any("NXDOMAIN" in w for w in success["warnings"]))
+
+    def testNonexistentDomainWithoutParentPolicy(self):
+        """Report both missing policy and the NXDOMAIN when no ancestor has a policy."""
+        with patch("checkdmarc.dmarc.query_dns", side_effect=dns.resolver.NXDOMAIN()):
+            result = checkdmarc.dmarc.check_dmarc("missing.example.com")
+        self.assertFalse(result["valid"])
+        self.assertIsNone(result["record"])
+        failure = cast(Any, result)
+        self.assertIn("parent domains", failure["error"])
+        self.assertTrue(any("NXDOMAIN" in w for w in failure["warnings"]))
 
     def testShortDomainNotFoundErrorString(self):
         """A 2-label not-found error has the short message"""

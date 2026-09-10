@@ -948,7 +948,14 @@ def query_dmarc_record(
         # _dmarc.{domain} answered above. A record that was already found
         # must not be discarded because of this courtesy query.
         if record is None:
-            raise DMARCRecordNotFound("The domain does not exist.")
+            # RFC 9989 section 4.10.1 also applies a parent policy to
+            # nonexistent subdomains (using np, or sp/p if np is absent).
+            # An apex NXDOMAIN therefore cannot stop policy discovery.
+            warnings.append(
+                f"The TXT lookup for {domain} returned NXDOMAIN; "
+                "checking parent domains for an applicable DMARC policy "
+                "(RFC 9989 section 4.10.1)."
+            )
     except dns.exception.DNSException:
         pass
 

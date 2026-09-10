@@ -12,6 +12,7 @@
 
 ### Fixed
 
+- Nonexistent subdomains continue DMARC discovery so parent `np` policies remain available (RFC 9989 §4.10.1).
 - Invalid optional DMARC flags and failure-report options use their specified defaults with warnings (RFC 9989 §4.8).
 - DMARC discovery discards unrelated TXT and duplicate policy sets, preserves warnings, and continues to applicable parent policies (RFC 9989 §4.10).
 - TLS reporting URIs accept valid HTTPS hosts and mailto components while rejecting malformed address escapes (RFC 8460 §3).
