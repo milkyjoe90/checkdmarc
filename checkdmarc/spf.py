@@ -1130,243 +1130,380 @@ def parse_spf_record(
     # and enforcing the RFC 7208 section 4.6.4 lookup limits after every
     # counted term.
     all_evaluated = False
-    for qualifier, name, sep, value, raw_value in prepared_terms:
-        if all_evaluated and sep != "=":
-            if name == "all":
-                warnings.append(
-                    "The record contains multiple all mechanisms; only the "
-                    "first one is used (RFC 7208 § 4.6.2)."
-                )
-            else:
-                warnings.append(
-                    "Mechanisms after the all mechanism are not evaluated "
-                    "(RFC 7208 § 4.6.2)."
-                )
-            continue
-        mechanism_dns_lookups = 0
-        mechanism_void_dns_lookups = 0
-        action = spf_qualifiers[qualifier]
-        mechanism = name
-        try:
-            if mechanism == "all":
-                all_evaluated = True
-                parsed["all"] = action
-
-            elif mechanism in ("ip4", "ip6"):
-                ip_mechanism: SPFMechanism = {
-                    "action": action,
-                    "mechanism": mechanism,
-                    "value": value,
-                }
-                parsed["mechanisms"].append(ip_mechanism)
-
-            elif mechanism == "a":
-                _count_dns_lookups()
-                mechanism_dns_lookups += 1
-                if "%" in value:
-                    macro_a_mechanism: SPFAMechanism = {
-                        "action": action,
-                        "mechanism": mechanism,
-                        "value": value,
-                        "dns_lookups": mechanism_dns_lookups,
-                        "void_dns_lookups": mechanism_void_dns_lookups,
-                        "addresses": [],
-                    }
-                    parsed["mechanisms"].append(macro_a_mechanism)
-                    continue
-                domain_part, ip4_cidr, ip6_cidr = _split_domain_cidr(value, mechanism)
-                # An a mechanism with no domain (a or a/24) means the
-                # current domain (RFC 7208 section 5.3)
-                value = domain_part or domain
-                a_records = get_a_records(
-                    value,
-                    nameservers=nameservers,
-                    resolver=resolver,
-                    timeout=timeout,
-                    retries=retries,
-                )
-                if len(a_records) == 0:
-                    # Do not pre-increment void counters here; let the outer
-                    # handler for _SPFMissingRecords account for a single void lookup.
-                    raise _SPFMissingRecords(
-                        f"An a mechanism points to {value.lower()}, but that domain/subdomain does not have any A/AAAA records."
-                    )
-                addresses = []
-                for address in a_records:
-                    # The IPv4 prefix applies to A records and the IPv6
-                    # prefix to AAAA records (RFC 7208 section 5.3)
-                    ip_version = ipaddress.ip_address(address).version
-                    if ip_version == 4 and ip4_cidr is not None:
-                        addresses.append(f"{address}/{ip4_cidr}")
-                    elif ip_version == 6 and ip6_cidr is not None:
-                        addresses.append(f"{address}/{ip6_cidr}")
-                    else:
-                        addresses.append(address)
-                a_mechanism: SPFAMechanism = {
-                    "action": action,
-                    "mechanism": mechanism,
-                    "value": value,
-                    "dns_lookups": mechanism_dns_lookups,
-                    "void_dns_lookups": mechanism_void_dns_lookups,
-                    "addresses": addresses,
-                }
-                parsed["mechanisms"].append(a_mechanism)
-
-            elif mechanism == "mx":
-                _count_dns_lookups()
-                mechanism_dns_lookups += 1
-                if "%" in value:
-                    macro_mx_mechanism: ParsedSPFMXMechanism = {
-                        "action": action,
-                        "mechanism": mechanism,
-                        "value": value,
-                        "dns_lookups": mechanism_dns_lookups,
-                        "void_dns_lookups": mechanism_void_dns_lookups,
-                        "hosts": [],
-                    }
-                    parsed["mechanisms"].append(macro_mx_mechanism)
-                    continue
-                # RFC 7208 sections 5.4 and 12: the dual-cidr-length applies
-                # to the addresses of the MX hosts, not to the MX query
-                # name, so strip it before querying DNS.
-                domain_part, _ip4_cidr, _ip6_cidr = _split_domain_cidr(value, mechanism)
-                # Use the current domain if no value was provided
-                value = domain_part or domain
-
-                # Query the MX records
-                mx_hosts = get_mx_records(
-                    value,
-                    nameservers=nameservers,
-                    resolver=resolver,
-                    timeout=timeout,
-                    retries=retries,
-                )
-
-                if len(mx_hosts) == 0:
-                    # MX query resulted in no records; count a single void lookup
-                    # in the outer warning handler to avoid double counting.
-                    raise _SPFMissingRecords(
-                        f"An mx mechanism points to {value.lower()}, "
-                        "but that domain/subdomain does not have any MX records."
-                    )
-
-                # RFC 7208 § 4.6.4: evaluating an mx term must not require
-                # more than 10 address lookups
-                if len(mx_hosts) > 10:
-                    raise SPFTooManyDNSLookups(
-                        f"{value} has more than 10 MX records (RFC 7208 § 4.6.4)",
-                        dns_lookups=len(mx_hosts),
-                    )
-                for host in mx_hosts:
-                    hostname = host["hostname"]
-                    try:
-                        host_addresses = get_a_records(
-                            hostname,
-                            nameservers=nameservers,
-                            resolver=resolver,
-                            timeout=timeout,
-                            retries=retries,
-                        )
-                    except DNSException as dnserror:
-                        raise _SPFWarning(str(dnserror))
-                    if len(host_addresses) == 0:
-                        # RFC 7208 section 4.6.4 defines void lookups per
-                        # term query; an MX host without address records is
-                        # not a void lookup, so warn without counting one.
-                        warnings.append(
-                            f"The MX host {hostname} does not have any A/AAAA records."
-                        )
-                mx_mechanism: ParsedSPFMXMechanism = {
-                    "action": action,
-                    "mechanism": mechanism,
-                    "value": value,
-                    "dns_lookups": mechanism_dns_lookups,
-                    "void_dns_lookups": mechanism_void_dns_lookups,
-                    "hosts": mx_hosts,
-                }
-                parsed["mechanisms"].append(mx_mechanism)
-
-            elif mechanism == "exists":
-                _count_dns_lookups()
-                mechanism_dns_lookups += 1
-                # RFC 7208 section 5.7 uses A records even for IPv6
-                # senders. A missing A answer is void even if AAAA exists.
-                if "%" in value:
+    try:
+        for qualifier, name, sep, value, raw_value in prepared_terms:
+            if all_evaluated and sep != "=":
+                if name == "all":
                     warnings.append(
-                        "The exists target contains macros and was not resolved; "
-                        "its void lookup count depends on the sender context "
-                        "(RFC 7208 § 5.7)."
+                        "The record contains multiple all mechanisms; only the "
+                        "first one is used (RFC 7208 § 4.6.2)."
                     )
                 else:
-                    try:
-                        a_records = query_dns(
-                            value,
-                            "A",
-                            nameservers=nameservers,
-                            resolver=resolver,
-                            timeout=timeout,
-                            retries=retries,
-                        )
-                    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
-                        a_records = []
-                    except dns.exception.DNSException as dns_error:
-                        raise DNSException(dns_error)
-                    if not a_records:
-                        raise _SPFMissingRecords(
-                            f"An exists mechanism points to {value}, but that "
-                            "domain/subdomain does not have any A records."
-                        )
-                exists_mechanism: SPFDNSLookupMechanism = {
-                    "action": action,
-                    "mechanism": mechanism,
-                    "value": value,
-                    "dns_lookups": mechanism_dns_lookups,
-                    "void_dns_lookups": mechanism_void_dns_lookups,
-                }
-                parsed["mechanisms"].append(exists_mechanism)
-
-            elif mechanism == "redirect":
-                # RFC 7208 section 6: more than one redirect modifier is a
-                # permanent error
-                if redirect_seen:
-                    raise SPFSyntaxError("Multiple redirect modifiers")
-                redirect_seen = True
-                if all_present:
-                    # RFC 7208 section 6.1: "Any 'redirect' modifier MUST be
-                    # ignored if there is an 'all' mechanism anywhere in the
-                    # record." No DNS queries, no lookup counting.
                     warnings.append(
-                        "The redirect modifier was ignored because the "
-                        "record contains an all mechanism (RFC 7208 § 6.1)."
+                        "Mechanisms after the all mechanism are not evaluated "
+                        "(RFC 7208 § 4.6.2)."
                     )
-                    continue
-                _count_dns_lookups()
-                mechanism_dns_lookups += 1
-                if "%" in value:
-                    macro_redirect: SPFRedirect = {
-                        "domain": domain,
-                        "record": None,
-                        "dns_lookups": mechanism_dns_lookups,
-                        "void_dns_lookups": mechanism_void_dns_lookups,
-                        "parsed": None,
-                        "warnings": [],
+                continue
+            mechanism_dns_lookups = 0
+            mechanism_void_dns_lookups = 0
+            action = spf_qualifiers[qualifier]
+            mechanism = name
+            try:
+                if mechanism == "all":
+                    all_evaluated = True
+                    parsed["all"] = action
+
+                elif mechanism in ("ip4", "ip6"):
+                    ip_mechanism: SPFMechanism = {
+                        "action": action,
+                        "mechanism": mechanism,
+                        "value": value,
                     }
-                    parsed["redirect"] = macro_redirect
-                    continue
-                if value in recursion:
-                    raise SPFRedirectLoop(f"Redirect loop: {value}")
-                seen.append(value)
-                try:
-                    redirect_query = query_spf_record(
+                    parsed["mechanisms"].append(ip_mechanism)
+
+                elif mechanism == "a":
+                    _count_dns_lookups()
+                    mechanism_dns_lookups += 1
+                    if "%" in value:
+                        macro_a_mechanism: SPFAMechanism = {
+                            "action": action,
+                            "mechanism": mechanism,
+                            "value": value,
+                            "dns_lookups": mechanism_dns_lookups,
+                            "void_dns_lookups": mechanism_void_dns_lookups,
+                            "addresses": [],
+                        }
+                        parsed["mechanisms"].append(macro_a_mechanism)
+                        continue
+                    domain_part, ip4_cidr, ip6_cidr = _split_domain_cidr(
+                        value, mechanism
+                    )
+                    # An a mechanism with no domain (a or a/24) means the
+                    # current domain (RFC 7208 section 5.3)
+                    value = domain_part or domain
+                    a_records = get_a_records(
                         value,
                         nameservers=nameservers,
                         resolver=resolver,
                         timeout=timeout,
                         retries=retries,
                     )
-                    redirect_record = redirect_query["record"]
-                    redirected_spf = parse_spf_record(
-                        redirect_record,
+                    if len(a_records) == 0:
+                        # Do not pre-increment void counters here; let the outer
+                        # handler for _SPFMissingRecords account for a single void lookup.
+                        raise _SPFMissingRecords(
+                            f"An a mechanism points to {value.lower()}, but that domain/subdomain does not have any A/AAAA records."
+                        )
+                    addresses = []
+                    for address in a_records:
+                        # The IPv4 prefix applies to A records and the IPv6
+                        # prefix to AAAA records (RFC 7208 section 5.3)
+                        ip_version = ipaddress.ip_address(address).version
+                        if ip_version == 4 and ip4_cidr is not None:
+                            addresses.append(f"{address}/{ip4_cidr}")
+                        elif ip_version == 6 and ip6_cidr is not None:
+                            addresses.append(f"{address}/{ip6_cidr}")
+                        else:
+                            addresses.append(address)
+                    a_mechanism: SPFAMechanism = {
+                        "action": action,
+                        "mechanism": mechanism,
+                        "value": value,
+                        "dns_lookups": mechanism_dns_lookups,
+                        "void_dns_lookups": mechanism_void_dns_lookups,
+                        "addresses": addresses,
+                    }
+                    parsed["mechanisms"].append(a_mechanism)
+
+                elif mechanism == "mx":
+                    _count_dns_lookups()
+                    mechanism_dns_lookups += 1
+                    if "%" in value:
+                        macro_mx_mechanism: ParsedSPFMXMechanism = {
+                            "action": action,
+                            "mechanism": mechanism,
+                            "value": value,
+                            "dns_lookups": mechanism_dns_lookups,
+                            "void_dns_lookups": mechanism_void_dns_lookups,
+                            "hosts": [],
+                        }
+                        parsed["mechanisms"].append(macro_mx_mechanism)
+                        continue
+                    # RFC 7208 sections 5.4 and 12: the dual-cidr-length applies
+                    # to the addresses of the MX hosts, not to the MX query
+                    # name, so strip it before querying DNS.
+                    domain_part, _ip4_cidr, _ip6_cidr = _split_domain_cidr(
+                        value, mechanism
+                    )
+                    # Use the current domain if no value was provided
+                    value = domain_part or domain
+
+                    # Query the MX records
+                    mx_hosts = get_mx_records(
+                        value,
+                        nameservers=nameservers,
+                        resolver=resolver,
+                        timeout=timeout,
+                        retries=retries,
+                    )
+
+                    if len(mx_hosts) == 0:
+                        # MX query resulted in no records; count a single void lookup
+                        # in the outer warning handler to avoid double counting.
+                        raise _SPFMissingRecords(
+                            f"An mx mechanism points to {value.lower()}, "
+                            "but that domain/subdomain does not have any MX records."
+                        )
+
+                    # RFC 7208 § 4.6.4: evaluating an mx term must not require
+                    # more than 10 address lookups
+                    if len(mx_hosts) > 10:
+                        raise SPFTooManyDNSLookups(
+                            f"{value} has more than 10 MX records (RFC 7208 § 4.6.4)",
+                            dns_lookups=len(mx_hosts),
+                        )
+                    for host in mx_hosts:
+                        hostname = host["hostname"]
+                        try:
+                            host_addresses = get_a_records(
+                                hostname,
+                                nameservers=nameservers,
+                                resolver=resolver,
+                                timeout=timeout,
+                                retries=retries,
+                            )
+                        except DNSException as dnserror:
+                            raise _SPFWarning(str(dnserror))
+                        if len(host_addresses) == 0:
+                            # RFC 7208 section 4.6.4 defines void lookups per
+                            # term query; an MX host without address records is
+                            # not a void lookup, so warn without counting one.
+                            warnings.append(
+                                f"The MX host {hostname} does not have any A/AAAA records."
+                            )
+                    mx_mechanism: ParsedSPFMXMechanism = {
+                        "action": action,
+                        "mechanism": mechanism,
+                        "value": value,
+                        "dns_lookups": mechanism_dns_lookups,
+                        "void_dns_lookups": mechanism_void_dns_lookups,
+                        "hosts": mx_hosts,
+                    }
+                    parsed["mechanisms"].append(mx_mechanism)
+
+                elif mechanism == "exists":
+                    _count_dns_lookups()
+                    mechanism_dns_lookups += 1
+                    # RFC 7208 section 5.7 uses A records even for IPv6
+                    # senders. A missing A answer is void even if AAAA exists.
+                    if "%" in value:
+                        warnings.append(
+                            "The exists target contains macros and was not resolved; "
+                            "its void lookup count depends on the sender context "
+                            "(RFC 7208 § 5.7)."
+                        )
+                    else:
+                        try:
+                            a_records = query_dns(
+                                value,
+                                "A",
+                                nameservers=nameservers,
+                                resolver=resolver,
+                                timeout=timeout,
+                                retries=retries,
+                            )
+                        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+                            a_records = []
+                        except dns.exception.DNSException as dns_error:
+                            raise DNSException(dns_error)
+                        if not a_records:
+                            raise _SPFMissingRecords(
+                                f"An exists mechanism points to {value}, but that "
+                                "domain/subdomain does not have any A records."
+                            )
+                    exists_mechanism: SPFDNSLookupMechanism = {
+                        "action": action,
+                        "mechanism": mechanism,
+                        "value": value,
+                        "dns_lookups": mechanism_dns_lookups,
+                        "void_dns_lookups": mechanism_void_dns_lookups,
+                    }
+                    parsed["mechanisms"].append(exists_mechanism)
+
+                elif mechanism == "redirect":
+                    # RFC 7208 section 6: more than one redirect modifier is a
+                    # permanent error
+                    if redirect_seen:
+                        raise SPFSyntaxError("Multiple redirect modifiers")
+                    redirect_seen = True
+                    if all_present:
+                        # RFC 7208 section 6.1: "Any 'redirect' modifier MUST be
+                        # ignored if there is an 'all' mechanism anywhere in the
+                        # record." No DNS queries, no lookup counting.
+                        warnings.append(
+                            "The redirect modifier was ignored because the "
+                            "record contains an all mechanism (RFC 7208 § 6.1)."
+                        )
+                        continue
+                    _count_dns_lookups()
+                    mechanism_dns_lookups += 1
+                    if "%" in value:
+                        macro_redirect: SPFRedirect = {
+                            "domain": domain,
+                            "record": None,
+                            "dns_lookups": mechanism_dns_lookups,
+                            "void_dns_lookups": mechanism_void_dns_lookups,
+                            "parsed": None,
+                            "warnings": [],
+                        }
+                        parsed["redirect"] = macro_redirect
+                        continue
+                    if value in recursion:
+                        raise SPFRedirectLoop(f"Redirect loop: {value}")
+                    seen.append(value)
+                    try:
+                        redirect_query = query_spf_record(
+                            value,
+                            nameservers=nameservers,
+                            resolver=resolver,
+                            timeout=timeout,
+                            retries=retries,
+                        )
+                        redirect_record = redirect_query["record"]
+                        redirected_spf = parse_spf_record(
+                            redirect_record,
+                            value,
+                            seen=seen,
+                            recursion=recursion + [value],
+                            nameservers=nameservers,
+                            resolver=resolver,
+                            timeout=timeout,
+                            retries=retries,
+                            _include_cache=_include_cache,
+                            _included=_included,
+                            _lookup_budget=budget,
+                        )
+                        parsed["all"] = redirected_spf["parsed"]["all"]
+                        mechanism_dns_lookups += redirected_spf["dns_lookups"]
+                        mechanism_void_dns_lookups += redirected_spf["void_dns_lookups"]
+                        _count_dns_lookups(
+                            redirected_spf["dns_lookups"], already_counted=True
+                        )
+                        _count_void_dns_lookups(
+                            redirected_spf["void_dns_lookups"], already_counted=True
+                        )
+                        redirect: SPFRedirect = {
+                            "domain": value,
+                            "record": redirect_record,
+                            "dns_lookups": mechanism_dns_lookups,
+                            "void_dns_lookups": mechanism_void_dns_lookups,
+                            "parsed": redirected_spf["parsed"],
+                            "warnings": redirected_spf["warnings"],
+                        }
+                        parsed["redirect"] = redirect
+
+                        warnings += redirected_spf["warnings"]
+                    except DNSException as redirect_err:
+                        # Local name distinct from the outer ``error`` accumulator;
+                        # ``except ... as <name>`` deletes the name when the block
+                        # exits, which would shadow and unset the function-level
+                        # ``error`` set at the top of parse_spf_record.
+                        if isinstance(redirect_err, DNSExceptionNXDOMAIN):
+                            # An NXDOMAIN answer for the redirect target is a
+                            # void lookup (RFC 7208 § 4.6.4)
+                            _count_void_dns_lookups()
+                        raise _SPFWarning(str(redirect_err))
+
+                elif mechanism == "exp":
+                    # RFC 7208 section 6: modifiers may appear anywhere in the
+                    # record, so honor exp even before the all mechanism. The
+                    # exp value keeps its original case because uppercase macro
+                    # letters change how macros expand (RFC 7208 section 7.3).
+                    if exp_seen:
+                        raise SPFSyntaxError("Multiple exp values are not permitted")
+                    exp_seen = True
+                    parsed["exp"] = raw_value
+                    _check_exp_value(raw_value)
+
+                elif mechanism == "include":
+                    if "%" in value:
+                        _count_dns_lookups()
+                        mechanism_dns_lookups += 1
+                        macro_include: SPFIncludeMechanism = {
+                            "action": action,
+                            "mechanism": mechanism,
+                            "value": value,
+                            "record": None,
+                            "dns_lookups": mechanism_dns_lookups,
+                            "void_dns_lookups": mechanism_void_dns_lookups,
+                            "parsed": None,
+                            "warnings": [],
+                        }
+                        parsed["mechanisms"].append(macro_include)
+                        continue
+                    if value in recursion:
+                        pointer = " -> ".join(recursion + [value])
+                        raise SPFIncludeLoop(f"Include loop: {pointer}")
+                    if value in seen:
+                        warnings.append(f"Duplicate include: {value}")
+                        cached_include = _include_cache.get(value)
+                        if cached_include is not None:
+                            # RFC 7208 section 4.6.4: real evaluation counts
+                            # every evaluated term, repeats included, so count
+                            # the duplicate again using the earlier parse result
+                            # instead of re-querying DNS.
+                            _count_dns_lookups(1 + cached_include["dns_lookups"])
+                            _count_void_dns_lookups(cached_include["void_dns_lookups"])
+                            duplicate_include_mechanism: SPFIncludeMechanism = {
+                                "action": action,
+                                "mechanism": mechanism,
+                                "value": value,
+                                "dns_lookups": 1 + cached_include["dns_lookups"],
+                                "void_dns_lookups": cached_include["void_dns_lookups"],
+                                "record": cached_include["record"],
+                                "parsed": cached_include["parsed"],
+                                "warnings": cached_include["warnings"],
+                            }
+                            parsed["mechanisms"].append(duplicate_include_mechanism)
+                            continue
+                    else:
+                        seen.append(value)
+                    _count_dns_lookups()
+                    mechanism_dns_lookups += 1
+                    try:
+                        include_query = query_spf_record(
+                            value,
+                            nameservers=nameservers,
+                            resolver=resolver,
+                            timeout=timeout,
+                            retries=retries,
+                        )
+                    except SPFRecordNotFound as missing_include:
+                        failed_include_mechanism: SPFIncludeMechanism = {
+                            "action": action,
+                            "mechanism": mechanism,
+                            "value": value,
+                            "record": None,
+                            "parsed": None,
+                            "dns_lookups": 1,
+                            "void_dns_lookups": 1,
+                            "warnings": [],
+                        }
+                        parsed["mechanisms"].append(failed_include_mechanism)
+                        _count_void_dns_lookups()
+                        # RFC 7208 section 5.2: when the recursive evaluation of
+                        # an include target returns "none" (no SPF record, or
+                        # the domain does not exist), the whole record is a
+                        # permanent error (permerror), not just a warning.
+                        raise SPFRecordNotFound(
+                            f"The include target {value} has no SPF record, "
+                            "which RFC 7208 § 5.2 defines as a permanent error "
+                            f"(permerror): {missing_include}",
+                            value,
+                        )
+                    include_record = include_query["record"]
+                    include = parse_spf_record(
+                        include_record,
                         value,
                         seen=seen,
                         recursion=recursion + [value],
@@ -1375,209 +1512,76 @@ def parse_spf_record(
                         timeout=timeout,
                         retries=retries,
                         _include_cache=_include_cache,
-                        _included=_included,
+                        _included=True,
                         _lookup_budget=budget,
                     )
-                    parsed["all"] = redirected_spf["parsed"]["all"]
-                    mechanism_dns_lookups += redirected_spf["dns_lookups"]
-                    mechanism_void_dns_lookups += redirected_spf["void_dns_lookups"]
-                    _count_dns_lookups(
-                        redirected_spf["dns_lookups"], already_counted=True
-                    )
+                    _include_cache[value] = include
+                    _count_dns_lookups(include["dns_lookups"], already_counted=True)
                     _count_void_dns_lookups(
-                        redirected_spf["void_dns_lookups"], already_counted=True
+                        include["void_dns_lookups"], already_counted=True
                     )
-                    redirect: SPFRedirect = {
-                        "domain": value,
-                        "record": redirect_record,
+                    mechanism_dns_lookups += include["dns_lookups"]
+                    mechanism_void_dns_lookups += include["void_dns_lookups"]
+                    include_mechanism: SPFIncludeMechanism = {
+                        "action": action,
+                        "mechanism": mechanism,
+                        "value": value,
                         "dns_lookups": mechanism_dns_lookups,
                         "void_dns_lookups": mechanism_void_dns_lookups,
-                        "parsed": redirected_spf["parsed"],
-                        "warnings": redirected_spf["warnings"],
+                        "record": include_record,
+                        "parsed": include["parsed"],
+                        "warnings": include["warnings"],
                     }
-                    parsed["redirect"] = redirect
+                    parsed["mechanisms"].append(include_mechanism)
+                    warnings += include["warnings"]
 
-                    warnings += redirected_spf["warnings"]
-                except DNSException as redirect_err:
-                    # Local name distinct from the outer ``error`` accumulator;
-                    # ``except ... as <name>`` deletes the name when the block
-                    # exits, which would shadow and unset the function-level
-                    # ``error`` set at the top of parse_spf_record.
-                    if isinstance(redirect_err, DNSExceptionNXDOMAIN):
-                        # An NXDOMAIN answer for the redirect target is a
-                        # void lookup (RFC 7208 § 4.6.4)
-                        _count_void_dns_lookups()
-                    raise _SPFWarning(str(redirect_err))
-
-            elif mechanism == "exp":
-                # RFC 7208 section 6: modifiers may appear anywhere in the
-                # record, so honor exp even before the all mechanism. The
-                # exp value keeps its original case because uppercase macro
-                # letters change how macros expand (RFC 7208 section 7.3).
-                if exp_seen:
-                    raise SPFSyntaxError("Multiple exp values are not permitted")
-                exp_seen = True
-                parsed["exp"] = raw_value
-                _check_exp_value(raw_value)
-
-            elif mechanism == "include":
-                if "%" in value:
+                elif mechanism == "ptr":
                     _count_dns_lookups()
                     mechanism_dns_lookups += 1
-                    macro_include: SPFIncludeMechanism = {
+                    # RFC 7208 section 5.5 starts from the SMTP sender's IP,
+                    # not the target domain's own address records. A domain-only
+                    # analysis cannot measure these sender-dependent voids.
+                    if value == "":
+                        value = domain
+                    ptr_mechanism: SPFDNSLookupMechanism = {
                         "action": action,
                         "mechanism": mechanism,
                         "value": value,
-                        "record": None,
                         "dns_lookups": mechanism_dns_lookups,
                         "void_dns_lookups": mechanism_void_dns_lookups,
-                        "parsed": None,
-                        "warnings": [],
                     }
-                    parsed["mechanisms"].append(macro_include)
-                    continue
-                if value in recursion:
-                    pointer = " -> ".join(recursion + [value])
-                    raise SPFIncludeLoop(f"Include loop: {pointer}")
-                if value in seen:
-                    warnings.append(f"Duplicate include: {value}")
-                    cached_include = _include_cache.get(value)
-                    if cached_include is not None:
-                        # RFC 7208 section 4.6.4: real evaluation counts
-                        # every evaluated term, repeats included, so count
-                        # the duplicate again using the earlier parse result
-                        # instead of re-querying DNS.
-                        _count_dns_lookups(1 + cached_include["dns_lookups"])
-                        _count_void_dns_lookups(cached_include["void_dns_lookups"])
-                        duplicate_include_mechanism: SPFIncludeMechanism = {
-                            "action": action,
-                            "mechanism": mechanism,
-                            "value": value,
-                            "dns_lookups": 1 + cached_include["dns_lookups"],
-                            "void_dns_lookups": cached_include["void_dns_lookups"],
-                            "record": cached_include["record"],
-                            "parsed": cached_include["parsed"],
-                            "warnings": cached_include["warnings"],
-                        }
-                        parsed["mechanisms"].append(duplicate_include_mechanism)
-                        continue
-                else:
-                    seen.append(value)
-                _count_dns_lookups()
-                mechanism_dns_lookups += 1
-                try:
-                    include_query = query_spf_record(
-                        value,
-                        nameservers=nameservers,
-                        resolver=resolver,
-                        timeout=timeout,
-                        retries=retries,
+                    parsed["mechanisms"].append(ptr_mechanism)
+                    raise _SPFWarning(
+                        "The ptr mechanism should not be used (RFC 7208 § 5.5); "
+                        "its reverse-DNS and void lookup checks require the sender "
+                        "IP and were not assessed."
                     )
-                except SPFRecordNotFound as missing_include:
-                    failed_include_mechanism: SPFIncludeMechanism = {
+
+            except (_SPFWarning, DNSException) as warning:
+                if isinstance(warning, (_SPFMissingRecords, DNSExceptionNXDOMAIN)):
+                    mechanism_void_dns_lookups += 1
+
+                    failed_mechanism: SPFDNSLookupMechanism = {
                         "action": action,
                         "mechanism": mechanism,
                         "value": value,
-                        "record": None,
-                        "parsed": None,
                         "dns_lookups": 1,
                         "void_dns_lookups": 1,
-                        "warnings": [],
                     }
-                    parsed["mechanisms"].append(failed_include_mechanism)
+                    parsed["mechanisms"].append(failed_mechanism)
                     _count_void_dns_lookups()
-                    # RFC 7208 section 5.2: when the recursive evaluation of
-                    # an include target returns "none" (no SPF record, or
-                    # the domain does not exist), the whole record is a
-                    # permanent error (permerror), not just a warning.
-                    raise SPFRecordNotFound(
-                        f"The include target {value} has no SPF record, "
-                        "which RFC 7208 § 5.2 defines as a permanent error "
-                        f"(permerror): {missing_include}",
-                        value,
-                    )
-                include_record = include_query["record"]
-                include = parse_spf_record(
-                    include_record,
-                    value,
-                    seen=seen,
-                    recursion=recursion + [value],
-                    nameservers=nameservers,
-                    resolver=resolver,
-                    timeout=timeout,
-                    retries=retries,
-                    _include_cache=_include_cache,
-                    _included=True,
-                    _lookup_budget=budget,
-                )
-                _include_cache[value] = include
-                _count_dns_lookups(include["dns_lookups"], already_counted=True)
-                _count_void_dns_lookups(
-                    include["void_dns_lookups"], already_counted=True
-                )
-                mechanism_dns_lookups += include["dns_lookups"]
-                mechanism_void_dns_lookups += include["void_dns_lookups"]
-                include_mechanism: SPFIncludeMechanism = {
-                    "action": action,
-                    "mechanism": mechanism,
-                    "value": value,
-                    "dns_lookups": mechanism_dns_lookups,
-                    "void_dns_lookups": mechanism_void_dns_lookups,
-                    "record": include_record,
-                    "parsed": include["parsed"],
-                    "warnings": include["warnings"],
-                }
-                parsed["mechanisms"].append(include_mechanism)
-                warnings += include["warnings"]
+                warnings.append(f"Error when processing {value or domain}: {warning!s}")
 
-            elif mechanism == "ptr":
-                _count_dns_lookups()
-                mechanism_dns_lookups += 1
-                # RFC 7208 section 5.5 starts from the SMTP sender's IP,
-                # not the target domain's own address records. A domain-only
-                # analysis cannot measure these sender-dependent voids.
-                if value == "":
-                    value = domain
-                ptr_mechanism: SPFDNSLookupMechanism = {
-                    "action": action,
-                    "mechanism": mechanism,
-                    "value": value,
-                    "dns_lookups": mechanism_dns_lookups,
-                    "void_dns_lookups": mechanism_void_dns_lookups,
-                }
-                parsed["mechanisms"].append(ptr_mechanism)
-                raise _SPFWarning(
-                    "The ptr mechanism should not be used (RFC 7208 § 5.5); "
-                    "its reverse-DNS and void lookup checks require the sender "
-                    "IP and were not assessed."
-                )
-
-        except (SPFTooManyDNSLookups, SPFTooManyVoidDNSLookups) as e:
-            if ignore_too_many_lookups:
-                # Return the diagnostic without performing further work.
-                # An exception raised deep in recursion carries the shared
-                # totals; local child totals may not have returned yet.
-                error = str(e)
-                total_dns_lookups = budget.dns
-                total_void_dns_lookups = budget.void
-                break
-            else:
-                raise
-
-        except (_SPFWarning, DNSException) as warning:
-            if isinstance(warning, (_SPFMissingRecords, DNSExceptionNXDOMAIN)):
-                mechanism_void_dns_lookups += 1
-
-                failed_mechanism: SPFDNSLookupMechanism = {
-                    "action": action,
-                    "mechanism": mechanism,
-                    "value": value,
-                    "dns_lookups": 1,
-                    "void_dns_lookups": 1,
-                }
-                parsed["mechanisms"].append(failed_mechanism)
-                _count_void_dns_lookups()
-            warnings.append(f"Error when processing {value or domain}: {warning!s}")
+    except (SPFTooManyDNSLookups, SPFTooManyVoidDNSLookups) as budget_error:
+        if not ignore_too_many_lookups:
+            raise
+        # A limit can be reached during a term, inside a nested include,
+        # or while counting a void in a warning handler. Stop all further
+        # work and return the same diagnostic for each path. The shared
+        # budget includes child totals that may not have returned yet.
+        error = str(budget_error)
+        total_dns_lookups = budget.dns
+        total_void_dns_lookups = budget.void
 
     # RFC 6652 § 3 semantic checks run after every modifier has been recorded.
     _check_rfc6652_semantics()

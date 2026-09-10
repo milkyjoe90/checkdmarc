@@ -1844,6 +1844,37 @@ class TestRFC7208Conformance(unittest.TestCase):
             )
         self.assertEqual(error.exception.data, {"void_dns_lookups": 3})
 
+    def testIgnoredVoidLimitReturnsDiagnosticAndStops(self):
+        """Returning limit errors instead of raising still stops at the third void."""
+        for nested in (False, True):
+            visited = []
+
+            def query(target, *args, visited=visited, **kwargs):
+                visited.append(target)
+                return []
+
+            remaining = "exists:b.example exists:c.example exists:unused.example -all"
+            record = (
+                "v=spf1 exists:a.example include:child.example -all"
+                if nested
+                else f"v=spf1 exists:a.example {remaining}"
+            )
+            with (
+                self.subTest(nested=nested),
+                patch("checkdmarc.spf.query_dns", side_effect=query),
+                patch(
+                    "checkdmarc.spf.query_spf_record",
+                    return_value={"record": f"v=spf1 {remaining}", "warnings": []},
+                ),
+            ):
+                result = checkdmarc.spf.parse_spf_record(
+                    record, "example.com", ignore_too_many_lookups=True
+                )
+            self.assertIn("3/2", str(result.get("error")))
+            self.assertEqual(result["void_dns_lookups"], 3)
+            self.assertEqual(result["dns_lookups"], 4 if nested else 3)
+            self.assertEqual(visited, ["a.example", "b.example", "c.example"])
+
     def testRecursiveLookupBudgetStopsBeforeEleventhTarget(self):
         """An attacker-controlled infinite chain is bounded before querying it."""
         for term in ("include:", "redirect="):
