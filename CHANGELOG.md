@@ -4,6 +4,7 @@
 
 ### Security
 
+- DNSSEC reuses parent authentication attempts within one check so repeated signatures cannot multiply failed chain walks.
 - BIMI bounds embedded-logo expansion, skips extraction from invalid certificates, and reports malformed gzip without aborting the check.
 - DNSSEC and TLSA signatures now require a chain to bundled IANA root keys, with resolver-scoped TTL and signature-expiry caches (RFC 4035 §5).
 - BIMI downloads require public destinations and HTTPS on every redirect, pin checked addresses while verifying TLS identity, and cap response size and redirects (BIMI draft §7.5).

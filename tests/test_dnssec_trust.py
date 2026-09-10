@@ -2,6 +2,7 @@
 
 import time
 import unittest
+from collections import Counter
 from unittest.mock import patch
 
 import dns.dnssec
@@ -262,3 +263,30 @@ class TestDNSSECTrust(unittest.TestCase):
             ),
             [self.dns.tlsa],
         )
+
+    def test_repeated_signers_do_not_repeat_failed_parent_walks(self):
+        # Each delegation has two distinct signatures naming the same parent.
+        # Without per-validation memoization, failed parent walks multiply at
+        # every level. Also repeat the TLSA signer at the top of the walk.
+        for key, (rrset, signatures) in list(self.dns.records.items()):
+            if key[1] in (dns.rdatatype.DS, dns.rdatatype.TLSA):
+                signature = next(iter(signatures))
+                signatures.add(signature.replace(signature=b"bad signature"))
+        root_key = (".", dns.rdatatype.DNSKEY)
+        original_root = self.dns.records[root_key]
+        self.dns.records.pop(root_key)
+        queries = Counter()
+
+        def query(request, nameserver, timeout):
+            question = request.question[0]
+            queries[(question.name.to_text(), question.rdtype)] += 1
+            return self.dns.query(request, nameserver, timeout)
+
+        with patch.object(dnssec, "_query_nameserver", side_effect=query):
+            self.assertEqual(self.tlsa(), [])
+        # Bound the observable network work, including the unavailable root.
+        self.assertEqual(sum(queries.values()), 6)
+        self.assertTrue(all(count == 1 for count in queries.values()))
+        # Failures are remembered only for this call, not the caller's cache.
+        self.dns.records[root_key] = original_root
+        self.assertEqual(self.tlsa(), [self.dns.tlsa])

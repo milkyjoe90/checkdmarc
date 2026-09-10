@@ -113,14 +113,26 @@ def _authenticate_zone_keys(
     nameservers: Sequence[str | Nameserver],
     timeout: float,
     cache: ExpiringDict,
+    *,
+    _attempts: dict[dns.name.Name, _AuthenticatedKeys | None] | None = None,
 ) -> _AuthenticatedKeys | None:
     """Authenticate a zone's keys through parent signatures to the IANA root."""
+    # Several DS signatures can name the same parent. Remember each attempt
+    # within this validation, including failures, so an untrusted chain does
+    # not trigger another whole tree walk for every signature. Never persist
+    # failures: the next caller must be able to recover from transient DNS.
+    if _attempts is None:
+        _attempts = {}
+    if zone in _attempts:
+        return _attempts[zone]
+    _attempts[zone] = None
     cache_key = (
         _dnssec_cache_key("authenticated-key", zone.to_text(), nameservers),
         tuple(str(ds) for ds in _ROOT_DS),
     )
     cached = _get_cached_dns(cache, cache_key)
     if isinstance(cached, _AuthenticatedKeys):
+        _attempts[zone] = cached
         return cached
     keys, key_signature, response = _query_rrset(
         zone.to_text(), RdataType.DNSKEY, nameservers, timeout
@@ -154,7 +166,9 @@ def _authenticate_zone_keys(
                 or signature.labels != len(zone.labels) - 1
             ):
                 continue
-            parent_keys = _authenticate_zone_keys(parent, nameservers, timeout, cache)
+            parent_keys = _authenticate_zone_keys(
+                parent, nameservers, timeout, cache, _attempts=_attempts
+            )
             if parent_keys is None:
                 continue
             try:
@@ -188,6 +202,7 @@ def _authenticate_zone_keys(
         return None
     result = _AuthenticatedKeys(keys, min(parent_expiration, keys_expiration))
     _cache_dns(cache, cache_key, result, result.expires_at)
+    _attempts[zone] = result
     return result
 
 
@@ -766,6 +781,7 @@ def get_tlsa_records(
     if response.rcode() != dns.rcode.NOERROR:
         return tlsa_records
     tlsa_expiration = _signature_expiration(rrset, rrsig)
+    attempts: dict[dns.name.Name, _AuthenticatedKeys | None] = {}
     for signature in rrsig:
         signer = signature.signer
         # RFC 4035 section 5.3.4: a wildcard signature alone does not
@@ -775,7 +791,9 @@ def get_tlsa_records(
             or signature.labels != len(rrset.name.labels) - 1
         ):
             continue
-        keys = _authenticate_zone_keys(signer, nameservers, timeout, cache)
+        keys = _authenticate_zone_keys(
+            signer, nameservers, timeout, cache, _attempts=attempts
+        )
         if keys is None:
             continue
         try:
