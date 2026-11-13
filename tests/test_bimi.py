@@ -788,6 +788,45 @@ class TestExtractLogoFromCertificate(unittest.TestCase):
 
 
 class TestCheckBimi(unittest.TestCase):
+    def testAssetDownloadsDefaultToFiveSecondHttpTimeout(self):
+        """BIMI image and certificate requests keep their own five-second timeout."""
+        cases = (
+            (
+                "image",
+                "v=BIMI1; l=https://example.com/logo.svg",
+                "Failed to download BIMI image at https://example.com/logo.svg - asset timeout",
+            ),
+            (
+                "certificate",
+                "v=BIMI1; l=; a=https://example.com/cert.pem",
+                "Failed to download the mark certificate at https://example.com/cert.pem - asset timeout",
+            ),
+        )
+        for case_id, record, expected_error in cases:
+            with self.subTest(case=case_id):
+                fake_session = MagicMock()
+                fake_session.get.side_effect = requests.Timeout("asset timeout")
+                with (
+                    patch(
+                        "checkdmarc.bimi.query_bimi_record",
+                        return_value={
+                            "record": record,
+                            "selector": "default",
+                            "location": "example.com",
+                            "warnings": [],
+                        },
+                    ),
+                    patch(
+                        "checkdmarc.bimi.requests.Session", return_value=fake_session
+                    ),
+                ):
+                    result = cast(
+                        Any, checkdmarc.bimi.check_bimi("example.com", timeout=0.001)
+                    )
+                self.assertTrue(result["valid"])
+                self.assertEqual(result[case_id]["error"], expected_error)
+                self.assertEqual(fake_session.get.call_args.kwargs["timeout"], 5.0)
+
     def testRecordNotFoundError(self):
         with patch(
             "checkdmarc.bimi.query_bimi_record",

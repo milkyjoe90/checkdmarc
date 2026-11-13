@@ -77,6 +77,17 @@ class SMTPError(Exception):
     """Raised when an SMTP error occurs"""
 
 
+def _format_smtp_response_error(error: smtplib.SMTPException) -> str:
+    """Keep the response code and all server-provided explanation lines."""
+    if not isinstance(error, smtplib.SMTPResponseException):
+        return str(error)
+    response = error.smtp_error
+    if isinstance(response, bytes):
+        response = response.decode("utf-8", errors="backslashreplace")
+    message = f"SMTP error code {error.smtp_code}"
+    return f"{message}: {response}" if response else message
+
+
 def test_tls(
     hostname: str,
     *,
@@ -153,28 +164,17 @@ def test_tls(
             cache[hostname] = {"tls": False, "error": error}
         raise SMTPError(error)
     except smtplib.SMTPConnectError as e:
-        message = e.__str__()
-        error_code = int(message.lstrip("(").split(",")[0])
-        if error_code == 554:
-            message = "SMTP error code 554 - Not allowed"
-        else:
-            message = f"SMTP error code {error_code}"
-        error = f"Could not connect: {message}"
+        error = f"Could not connect: {_format_smtp_response_error(e)}"
         if cache is not None:
             cache[hostname] = {"tls": False, "error": error}
         raise SMTPError(error)
     except smtplib.SMTPHeloError as e:
-        error = f"HELO error: {e}"
+        error = f"HELO error: {_format_smtp_response_error(e)}"
         if cache is not None:
             cache[hostname] = {"tls": False, "error": error}
         raise SMTPError(error)
     except smtplib.SMTPException as e:
-        error = e.__str__()
-        try:
-            error_code = error.lstrip("(").split(",")[0]
-            error = f"SMTP error code {error_code}"
-        except ValueError:
-            pass
+        error = _format_smtp_response_error(e)
         if cache is not None:
             cache[hostname] = {"tls": False, "error": error}
         raise SMTPError(error)
@@ -267,28 +267,17 @@ def test_starttls(
             cache[hostname] = {"starttls": False, "error": error}
         raise SMTPError(error)
     except smtplib.SMTPConnectError as e:
-        message = e.__str__()
-        error_code = int(message.lstrip("(").split(",")[0])
-        if error_code == 554:
-            message = "SMTP error code 554 - Not allowed"
-        else:
-            message = f"SMTP error code {error_code}"
-        error = f"Could not connect: {message}"
+        error = f"Could not connect: {_format_smtp_response_error(e)}"
         if cache is not None:
             cache[hostname] = {"starttls": False, "error": error}
         raise SMTPError(error)
     except smtplib.SMTPHeloError as e:
-        error = f"HELO error: {e}"
+        error = f"HELO error: {_format_smtp_response_error(e)}"
         if cache is not None:
             cache[hostname] = {"starttls": False, "error": error}
         raise SMTPError(error)
     except smtplib.SMTPException as e:
-        error = e.__str__()
-        try:
-            error_code = error.lstrip("(").split(",")[0]
-            error = f"SMTP error code {error_code}"
-        except ValueError:
-            pass
+        error = _format_smtp_response_error(e)
         if cache is not None:
             cache[hostname] = {"starttls": False, "error": error}
         raise SMTPError(error)

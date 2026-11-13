@@ -19,6 +19,7 @@ concurrency:
 jobs:
   ci:
     name: CI
+    if: github.repository == 'domainaware/checkdmarc'
     uses: ./.github/workflows/ci.yml
     secrets: inherit
 
@@ -30,6 +31,7 @@ jobs:
   # This job is what stops a release shipping with one of those open.
   code-scanning:
     name: No open code scanning alerts
+    if: github.repository == 'domainaware/checkdmarc'
     runs-on: ubuntu-latest
     permissions:
       contents: read

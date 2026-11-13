@@ -1,0 +1,132 @@
+name: Cybaa Release
+
+on:
+  push:
+    tags:
+      - '*\+cybaa.*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cybaa-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    name: CI
+    if: github.repository == 'milkyjoe90/checkdmarc'
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
+
+  build:
+    name: Build and verify Cybaa distributions
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Verify the installed wheel
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/cybaa-release-venv"
+          "$RUNNER_TEMP/cybaa-release-venv/bin/python" -m pip install dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/cybaa-release-venv/bin/python" - <<'PY'
+          from importlib.metadata import version
+          import os
+          from pathlib import Path
+          import smtplib
+          import subprocess
+          import sys
+          from unittest.mock import patch
+
+          import checkdmarc
+          from checkdmarc._constants import DEFAULT_HTTP_TIMEOUT
+          import checkdmarc.smtp as smtp
+
+          expected_version = os.environ["GITHUB_REF_NAME"]
+          assert version("checkdmarc") == expected_version
+          assert checkdmarc.__version__ == expected_version
+          assert DEFAULT_HTTP_TIMEOUT == 5.0
+          assert Path(checkdmarc.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
+          cli = subprocess.run(
+              [str(Path(sys.executable).parent / "checkdmarc"), "--version"],
+              check=True, capture_output=True, text=True,
+          )
+          assert cli.stdout.strip() == expected_version
+
+          reply = b"4.3.2 Service unavailable, retry later\n[release diagnostic-id]"
+          expected_error = (
+              "Could not connect: SMTP error code 421: "
+              "4.3.2 Service unavailable, retry later\n[release diagnostic-id]"
+          )
+          for probe, client in ((smtp.test_starttls, "SMTP"), (smtp.test_tls, "SMTP_SSL")):
+              with patch.object(smtplib, client, side_effect=smtplib.SMTPConnectError(421, reply)):
+                  try:
+                      probe("mx.example.com")
+                  except smtp.SMTPError as error:
+                      assert str(error) == expected_error
+                  else:
+                      raise AssertionError("SMTP probe did not preserve its server rejection")
+          print(f"Verified installed checkdmarc {expected_version}: SMTP replies and HTTP timeout")
+          PY
+
+      - name: Prepare checksums and release notes
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum *.whl *.tar.gz > SHA256SUMS)
+          awk -v ver="$GITHUB_REF_NAME" '
+            $0 == "## " ver {found=1; next}
+            /^## / && found {exit}
+            found {print}
+          ' CHANGELOG.md > dist/RELEASE_NOTES.md
+          if ! [ -s dist/RELEASE_NOTES.md ]; then
+            echo "No CHANGELOG.md section found for $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
+      - name: Upload verified distributions
+        uses: actions/upload-artifact@v7
+        with:
+          name: cybaa-dist
+          path: dist/
+          if-no-files-found: error
+
+  github-release:
+    name: Publish Cybaa GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified distributions
+        uses: actions/download-artifact@v8
+        with:
+          name: cybaa-dist
+          path: dist/
+
+      - name: Verify distribution checksums
+        run: cd dist && sha256sum --check SHA256SUMS
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.whl dist/*.tar.gz dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file dist/RELEASE_NOTES.md
