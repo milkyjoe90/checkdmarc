@@ -673,7 +673,7 @@ class TestCheckMtaStsSuccess(unittest.TestCase):
 
 
 class TestCheckMtaStsHttpTimeout(unittest.TestCase):
-    def testPolicyDownloadUsesItsOwnHttpTimeout(self):
+    def testPolicyDownloadDefaultsToFiveSecondHttpTimeout(self):
         """check_mta_sts's timeout parameter is the DNS timeout; the policy
         download request uses the HTTP default. The DNS timeout was
         previously passed straight through as the HTTP timeout, so tuning
@@ -699,10 +699,7 @@ class TestCheckMtaStsHttpTimeout(unittest.TestCase):
         ):
             result = checkdmarc.mta_sts.check_mta_sts("example.com", timeout=0.001)
         self.assertTrue(result["valid"])
-        self.assertEqual(
-            fake_session.get.call_args.kwargs["timeout"],
-            checkdmarc.mta_sts.DEFAULT_HTTP_TIMEOUT,
-        )
+        self.assertEqual(fake_session.get.call_args.kwargs["timeout"], 5.0)
 
 
 class TestTxtCnameConflictWiring(unittest.TestCase):

@@ -1,5 +1,19 @@
 # Changelog
 
+## 6.0.4+cybaa.1
+
+### Fixed
+
+- SMTP: preserve server response codes and complete explanation text, including
+  multiline replies, in STARTTLS and implicit TLS failure warnings.
+
+### Changed
+
+- Use a five-second default for BIMI and MTA-STS HTTP requests, preserving
+  Cybaa's existing runtime timeout without modifying installed package files.
+- Publish Cybaa distributions and checksums through GitHub releases; upstream
+  PyPI publishing and documentation deployment run only in the upstream repository.
+
 ## 6.0.4
 
 ### Fixed

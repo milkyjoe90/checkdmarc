@@ -9,6 +9,7 @@ import smtplib
 import socket
 import ssl
 import unittest
+from contextlib import ExitStack
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
@@ -277,6 +278,123 @@ class TestTestSTARTTLS(unittest.TestCase):
         self.assertIn("554", str(ctx.exception))
 
 
+class TestSmtpDiagnostics(unittest.TestCase):
+    PROBES = (
+        ("starttls", "test_starttls", "SMTP", "starttls"),
+        ("implicit_tls", "test_tls", "SMTP_SSL", "tls"),
+    )
+
+    def testConnectErrorsPreserveFullResponseAndCache(self):
+        reply = b"4.3.2 Service unavailable, closing transmission channel\n[SERVER diagnostic-id]"
+        expected = (
+            "Could not connect: SMTP error code 421: "
+            "4.3.2 Service unavailable, closing transmission channel\n[SERVER diagnostic-id]"
+        )
+        for case_id, probe_name, client_name, result_key in self.PROBES:
+            with self.subTest(case=case_id):
+                cache = ExpiringDict(max_len=10, max_age_seconds=60)
+                with patch.object(
+                    checkdmarc.smtp.smtplib,
+                    client_name,
+                    side_effect=smtplib.SMTPConnectError(421, reply),
+                ) as client:
+                    for _ in range(2):
+                        with self.assertRaises(checkdmarc.smtp.SMTPError) as raised:
+                            getattr(checkdmarc.smtp, probe_name)(
+                                "mx.example.com", cache=cache
+                            )
+                        self.assertEqual(expected, str(raised.exception))
+                self.assertEqual(
+                    {result_key: False, "error": expected}, cache["mx.example.com"]
+                )
+                client.assert_called_once()
+
+    def testHeloErrorsPreserveFullServerResponse(self):
+        reply = b"5.5.1 EHLO rejected, retry later\n[HELO diagnostic-id]"
+        expected = (
+            "HELO error: SMTP error code 550: "
+            "5.5.1 EHLO rejected, retry later\n[HELO diagnostic-id]"
+        )
+        for case_id, probe_name, client_name, _ in self.PROBES:
+            with self.subTest(case=case_id):
+                with patch.object(checkdmarc.smtp.smtplib, client_name) as client:
+                    session = client.return_value.__enter__.return_value
+                    session.ehlo_or_helo_if_needed.side_effect = smtplib.SMTPHeloError(
+                        550, reply
+                    )
+                    with self.assertRaises(checkdmarc.smtp.SMTPError) as raised:
+                        getattr(checkdmarc.smtp, probe_name)("mx.example.com")
+                self.assertEqual(expected, str(raised.exception))
+
+    def testResponseErrorsPreserveTlsRejectionDetails(self):
+        reply = b"4.7.0 TLS unavailable, try again\n[TLS diagnostic-id]"
+        expected = (
+            "SMTP error code 454: 4.7.0 TLS unavailable, try again\n[TLS diagnostic-id]"
+        )
+        for case_id, probe_name, client_name, _ in self.PROBES:
+            with self.subTest(case=case_id):
+                with patch.object(checkdmarc.smtp.smtplib, client_name) as client:
+                    session = client.return_value.__enter__.return_value
+                    if case_id == "starttls":
+                        session.has_extn.return_value = True
+                        session.starttls.side_effect = smtplib.SMTPResponseException(
+                            454, reply
+                        )
+                    else:
+                        session.ehlo_or_helo_if_needed.side_effect = (
+                            smtplib.SMTPResponseException(454, reply)
+                        )
+                    with self.assertRaises(checkdmarc.smtp.SMTPError) as raised:
+                        getattr(checkdmarc.smtp, probe_name)("mx.example.com")
+                self.assertEqual(expected, str(raised.exception))
+
+    def testDisconnectedErrorsPreserveText(self):
+        message = (
+            "Connection unexpectedly closed, server detail\n[disconnect diagnostic-id]"
+        )
+        for case_id, probe_name, client_name, _ in self.PROBES:
+            with self.subTest(case=case_id):
+                with (
+                    patch.object(
+                        checkdmarc.smtp.smtplib,
+                        client_name,
+                        side_effect=smtplib.SMTPServerDisconnected(message),
+                    ),
+                    self.assertRaises(checkdmarc.smtp.SMTPError) as raised,
+                ):
+                    getattr(checkdmarc.smtp, probe_name)("mx.example.com")
+                self.assertEqual(message, str(raised.exception))
+
+    def testServerResponseEncoding(self):
+        cases = (
+            (
+                "utf8",
+                smtplib.SMTPResponseException(550, "5.7.1 accès refusé".encode()),
+                "SMTP error code 550: 5.7.1 accès refusé",
+            ),
+            (
+                "invalid_utf8",
+                smtplib.SMTPResponseException(550, b"5.7.1 reply \xff"),
+                "SMTP error code 550: 5.7.1 reply \\xff",
+            ),
+            (
+                "text_response",
+                smtplib.SMTPResponseException(451, "4.3.0 text response, retry"),
+                "SMTP error code 451: 4.3.0 text response, retry",
+            ),
+            (
+                "empty_response",
+                smtplib.SMTPResponseException(421, b""),
+                "SMTP error code 421",
+            ),
+        )
+        for case_id, error, expected in cases:
+            with self.subTest(case=case_id):
+                self.assertEqual(
+                    expected, checkdmarc.smtp._format_smtp_response_error(error)
+                )
+
+
 class TestGetMxHosts(unittest.TestCase):
     """Coverage for checkdmarc.smtp.get_mx_hosts"""
 
@@ -330,6 +448,60 @@ class TestGetMxHosts(unittest.TestCase):
                 return_value=tlsa if tlsa is not None else [],
             ),
         ]
+
+    def testWarningPreservesFullStarttlsConnectResponse(self):
+        checkdmarc.smtp.STARTTLS_CACHE.clear()
+        reply = b"4.3.2 Service unavailable, closing transmission channel\n[MX diagnostic-id]"
+        expected = (
+            "mail.example.com: Could not connect: SMTP error code 421: "
+            "4.3.2 Service unavailable, closing transmission channel\n[MX diagnostic-id]"
+        )
+        with ExitStack() as stack:
+            for dns_patch in self._patch_dns(
+                [self._mx("mail.example.com")], reverse=["mail.example.com"]
+            ):
+                stack.enter_context(dns_patch)
+            stack.enter_context(patch("platform.system", return_value="Linux"))
+            stack.enter_context(
+                patch("smtplib.SMTP", side_effect=smtplib.SMTPConnectError(421, reply))
+            )
+            implicit_tls = stack.enter_context(patch("smtplib.SMTP_SSL"))
+            result = checkdmarc.smtp.get_mx_hosts("example.com", check_mx_tls=True)
+
+        self.assertEqual([expected], result["warnings"])
+        self.assertFalse(cast(Any, result["hosts"][0])["starttls"])
+        implicit_tls.assert_not_called()
+
+    def testWarningPreservesFullImplicitTlsFallbackResponse(self):
+        checkdmarc.smtp.STARTTLS_CACHE.clear()
+        checkdmarc.smtp.TLS_CACHE.clear()
+        reply = (
+            b"5.7.1 Connection refused, policy restriction\n[fallback diagnostic-id]"
+        )
+        expected = (
+            "mail.example.com: implicit TLS on port 465 failed: Could not connect: "
+            "SMTP error code 554: 5.7.1 Connection refused, policy restriction\n[fallback diagnostic-id]"
+        )
+        with ExitStack() as stack:
+            for dns_patch in self._patch_dns(
+                [self._mx("mail.example.com")], reverse=["mail.example.com"]
+            ):
+                stack.enter_context(dns_patch)
+            stack.enter_context(patch("platform.system", return_value="Linux"))
+            starttls = stack.enter_context(patch("smtplib.SMTP"))
+            starttls.return_value.__enter__.return_value.has_extn.return_value = False
+            stack.enter_context(
+                patch(
+                    "smtplib.SMTP_SSL", side_effect=smtplib.SMTPConnectError(554, reply)
+                )
+            )
+            result = checkdmarc.smtp.get_mx_hosts("example.com", check_mx_tls=True)
+
+        self.assertEqual(
+            ["STARTTLS is not supported on mail.example.com.", expected],
+            result["warnings"],
+        )
+        self.assertFalse(cast(Any, result["hosts"][0])["starttls"])
 
     def testSuccessSkipTLS(self):
         """A clean single-MX domain returns no warnings by default"""
@@ -857,8 +1029,7 @@ class TestTLSCacheWritesOnError(unittest.TestCase):
         self._run_and_check_cache(smtplib.SMTPException("(550, b'denied')"))
 
     def testSMTPExceptionWithBareMessage(self):
-        """An SMTPException whose message isn't a tuple-formatted string falls
-        through the inner try/except ValueError branch"""
+        """A non-response SMTPException keeps its original text in the cache."""
         cache = self._make_cache()
         with (
             patch("smtplib.SMTP_SSL", side_effect=smtplib.SMTPException("denied")),
@@ -866,8 +1037,7 @@ class TestTLSCacheWritesOnError(unittest.TestCase):
         ):
             checkdmarc.smtp.test_tls("mail.example.com", cache=cache)
         entry = cast(dict, cache["mail.example.com"])
-        # Even when the inner int() ValueError fires, the message is cached.
-        self.assertIsNotNone(entry["error"])
+        self.assertEqual(entry["error"], "denied")
 
     def testOSErrorCached(self):
         self._run_and_check_cache(OSError("Network unreachable"))
